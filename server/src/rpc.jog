@@ -1,0 +1,606 @@
+// Diagnostics-only session. initialize advertises full text sync and
+// save notifications. didSave runs jog check and publishes one list per
+// file. A file that was dirty and is now clean gets an empty list, which
+// is what clears the squiggles. Requests before initialize get -32002.
+// Requests after shutdown get -32600. exit sets the process status:
+// 0 after shutdown, 1 otherwise. Bad JSON is ignored and the loop stays up.
+
+import std.io
+import std.list as lists
+import std.mem
+import std.proc
+import std.strbuilder
+
+val state_new: u8 = 0
+val state_run: u8 = 1
+val state_down: u8 = 2
+
+struct Doc {
+    uri: str
+    path: str
+    norm: str
+    version: i64
+    text: str
+}
+
+struct Server {
+    state: u8
+    exit_code: i32
+    should_exit: bool
+    jog: str
+    docs: lists.List<Doc>
+    published: lists.List<str>
+}
+
+struct Bucket {
+    key: str
+    uri: str
+    n: usize
+}
+
+fn server_new(jog: str): Server with (a: mem.Allocator) {
+    var srv = Server()
+    srv.jog = copy_str(jog)
+    return srv
+}
+
+fn *Doc.release() with (a: mem.Allocator) {
+    free_str(self.uri)
+    free_str(self.path)
+    free_str(self.norm)
+    free_str(self.text)
+    self.uri = ""
+    self.path = ""
+    self.norm = ""
+    self.text = ""
+}
+
+fn *Server.release() with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < self.docs.len {
+        var doc = self.docs.get(i)
+        doc.release()
+        i = i + 1
+    }
+    self.docs.free()
+    i = 0
+    for i < self.published.len {
+        free_str(self.published.get(i))
+        i = i + 1
+    }
+    self.published.free()
+    free_str(self.jog)
+    self.jog = ""
+}
+
+fn *Bucket.release() with (a: mem.Allocator) {
+    free_str(self.key)
+    free_str(self.uri)
+    self.key = ""
+    self.uri = ""
+}
+
+fn free_buckets(xs: *lists.List<Bucket>) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < xs.len {
+        var item = xs.get(i)
+        item.release()
+        i = i + 1
+    }
+    xs.free()
+}
+
+fn free_strs(xs: *lists.List<str>) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < xs.len {
+        free_str(xs.get(i))
+        i = i + 1
+    }
+    xs.free()
+}
+
+fn emit_result(out: *strbuilder.StrBuilder, id: *Json, result: *Json) with (a: mem.Allocator) {
+    var body = strbuilder.empty()
+    body.append("{\"jsonrpc\":\"2.0\",\"id\":")
+    write_json(id, &body)
+    body.append(",\"result\":")
+    write_json(result, &body)
+    body.append("}")
+    write_frame(out, body.str())
+    body.free()
+}
+
+fn emit_error(out: *strbuilder.StrBuilder, id: *Json, code: i64, msg: str) with (a: mem.Allocator) {
+    var body = strbuilder.empty()
+    body.append("{\"jsonrpc\":\"2.0\",\"id\":")
+    write_json(id, &body)
+    body.append(",\"error\":{\"code\":")
+    body.append_int(code, 10)
+    body.append(",\"message\":")
+    write_string(msg, &body)
+    body.append("}}")
+    write_frame(out, body.str())
+    body.free()
+}
+
+fn emit_note(out: *strbuilder.StrBuilder, method: str, params: *Json) with (a: mem.Allocator) {
+    var body = strbuilder.empty()
+    body.append("{\"jsonrpc\":\"2.0\",\"method\":")
+    write_string(method, &body)
+    body.append(",\"params\":")
+    write_json(params, &body)
+    body.append("}")
+    write_frame(out, body.str())
+    body.free()
+}
+
+fn capabilities(): Json with (a: mem.Allocator) {
+    var sync = j_obj()
+    sync.put_bool("openClose", true)
+    sync.put_int("change", 1)
+    sync.put_bool("save", true)
+    var caps = j_obj()
+    caps.put("textDocumentSync", sync)
+    var result = j_obj()
+    result.put("capabilities", caps)
+    return result
+}
+
+fn *Server.doc_at(uri: str): (usize, bool) {
+    var i: usize = 0
+    for i < self.docs.len {
+        if self.docs.get(i).uri == uri {
+            return i, true
+        }
+        i = i + 1
+    }
+    return 0, false
+}
+
+fn *Server.upsert(uri: str, version: i64, text: str) with (a: mem.Allocator) {
+    var (idx, found) = self.doc_at(uri)
+    if found {
+        var doc = self.docs.get(idx)
+        free_str(doc.text)
+        doc.text = copy_str(text)
+        doc.version = version
+        self.docs.set(idx, doc)
+        return
+    }
+    var doc = Doc()
+    doc.uri = copy_str(uri)
+    var (path, ok) = uri_to_path(uri)
+    if ok {
+        doc.path = path
+        doc.norm = norm_path(path)
+    }
+    doc.version = version
+    doc.text = copy_str(text)
+    self.docs.push(doc)
+}
+
+fn *Server.drop_doc(uri: str) with (a: mem.Allocator) {
+    var (idx, found) = self.doc_at(uri)
+    if !found {
+        return
+    }
+    var doc = self.docs.remove(idx)
+    doc.release()
+}
+
+fn list_has(xs: *lists.List<str>, text: str): bool {
+    var i: usize = 0
+    for i < xs.len {
+        if xs.get(i) == text {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn point_diag(message: str): Json with (a: mem.Allocator) {
+    var start = j_obj()
+    start.put_int("line", 0)
+    start.put_int("character", 0)
+    var endp = j_obj()
+    endp.put_int("line", 0)
+    endp.put_int("character", 0)
+    var range = j_obj()
+    range.put("start", start)
+    range.put("end", endp)
+    var one = j_obj()
+    one.put("range", range)
+    one.put_int("severity", 1)
+    one.put_str("message", message)
+    var arr = j_arr()
+    arr.items.push(one)
+    return arr
+}
+
+fn diags_for(text: str, all: *lists.List<Diag>, key: str): Json with (a: mem.Allocator) {
+    var arr = j_arr()
+    var i: usize = 0
+    for i < all.len {
+        var item = all.get(i)
+        val norm = norm_path(item.path)
+        if norm == key {
+            val (line, start, endc) = lsp_range(text, item.line, item.column)
+            var sp = j_obj()
+            sp.put_int("line", line)
+            sp.put_int("character", start)
+            var ep = j_obj()
+            ep.put_int("line", line)
+            ep.put_int("character", endc)
+            var range = j_obj()
+            range.put("start", sp)
+            range.put("end", ep)
+            var one = j_obj()
+            one.put("range", range)
+            one.put_int("severity", severity_code(item.severity))
+            one.put_str("message", item.message)
+            arr.items.push(one)
+        }
+        free_str(norm)
+        i = i + 1
+    }
+    return arr
+}
+
+fn *Server.text_of(uri: str): (str, i64, bool) {
+    var (idx, found) = self.doc_at(uri)
+    if !found {
+        return "", 0, false
+    }
+    var doc = self.docs.get(idx)
+    return doc.text, doc.version, true
+}
+
+fn run_check(jog: str, path: str): (lists.List<Diag>, bool) with (a: mem.Allocator) {
+    var args: lists.List<str>
+    args.push(jog)
+    args.push("check")
+    args.push(path)
+    args.push("--diag=json")
+    val output = proc.run(args.slice_view())
+    args.free()
+    if !output.ok {
+        proc.free_output(output)
+        var empty: lists.List<Diag>
+        return empty, false
+    }
+    val text: str = output.stdout
+    var (diags, ok) = parse_diag_lines(text)
+    if !ok {
+        proc.free_output(output)
+        var empty: lists.List<Diag>
+        return empty, false
+    }
+    if output.code != 0 && diags.len == 0 {
+        io.eprint("jog check failed\n")
+        val err: str = output.stderr
+        if err.len > 0 {
+            io.eprint(err)
+        }
+    }
+    proc.free_output(output)
+    return diags, true
+}
+
+fn *Server.uri_for(key: str, fallback: str): str with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < self.docs.len {
+        var doc = self.docs.get(i)
+        if doc.norm == key {
+            return copy_str(doc.uri)
+        }
+        i = i + 1
+    }
+    return path_to_uri(fallback)
+}
+
+fn *Server.add_bucket(xs: *lists.List<Bucket>, key: str, uri: str): usize with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < xs.len {
+        if xs.get(i).key == key {
+            return i
+        }
+        i = i + 1
+    }
+    var bucket = Bucket()
+    bucket.key = copy_str(key)
+    bucket.uri = copy_str(uri)
+    xs.push(bucket)
+    return xs.len - 1
+}
+
+fn *Server.publish(uri: str, items: Json, out: *strbuilder.StrBuilder) with (a: mem.Allocator) {
+    var params = j_obj()
+    params.put_str("uri", uri)
+    var (text, version, found) = self.text_of(uri)
+    if found {
+        params.put_int("version", version)
+    }
+    params.put("diagnostics", items)
+    emit_note(out, "textDocument/publishDiagnostics", &params)
+    params.release()
+}
+
+fn *Server.publish_empty(uri: str, out: *strbuilder.StrBuilder) with (a: mem.Allocator) {
+    self.publish(uri, j_arr(), out)
+}
+
+fn *Server.on_save(uri: str, out: *strbuilder.StrBuilder) with (a: mem.Allocator) {
+    var (path, pok) = uri_to_path(uri)
+    if !pok {
+        io.eprint("bad uri\n")
+        return
+    }
+    var (diags, ok) = run_check(self.jog, path)
+    var buckets: lists.List<Bucket>
+    val saved_norm = norm_path(path)
+    val saved_uri = copy_str(uri)
+    self.add_bucket(&buckets, saved_norm, saved_uri)
+    if ok {
+        var i: usize = 0
+        for i < diags.len {
+            var item = diags.get(i)
+            val key = norm_path(item.path)
+            val file_uri = self.uri_for(key, item.path)
+            val idx = self.add_bucket(&buckets, key, file_uri)
+            var bucket = buckets.get(idx)
+            bucket.n = bucket.n + 1
+            buckets.set(idx, bucket)
+            free_str(key)
+            free_str(file_uri)
+            i = i + 1
+        }
+    }
+    var emitted: lists.List<str>
+    var still: lists.List<str>
+    var i: usize = 0
+    for i < buckets.len {
+        var bucket = buckets.get(i)
+        if ok {
+            var (text, ver, found) = self.text_of(bucket.uri)
+            var body = ""
+            if found {
+                body = text
+            }
+            var items = diags_for(body, &diags, bucket.key)
+            self.publish(bucket.uri, items, out)
+        } else if bucket.uri == saved_uri {
+            var items = point_diag("cannot run jog check")
+            self.publish(bucket.uri, items, out)
+        }
+        emitted.push(copy_str(bucket.uri))
+        if bucket.n > 0 {
+            still.push(copy_str(bucket.uri))
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < self.published.len {
+        val prev = self.published.get(i)
+        if !list_has(&emitted, prev) {
+            self.publish_empty(prev, out)
+        }
+        i = i + 1
+    }
+    free_strs(&self.published)
+    self.published = still
+    free_strs(&emitted)
+    free_buckets(&buckets)
+    free_str(saved_norm)
+    free_str(saved_uri)
+    free_str(path)
+    if ok {
+        free_diags(&diags)
+    }
+}
+
+fn *Server.on_open(params: *Json) with (a: mem.Allocator) {
+    var (doc, ok) = params.field("textDocument")
+    if !ok {
+        return
+    }
+    var (uri, uok) = doc.str_field("uri")
+    var (text, tok) = doc.str_field("text")
+    if !uok || !tok {
+        return
+    }
+    var version: i64 = 0
+    var (ver, vok) = doc.int_field("version")
+    if vok {
+        version = ver
+    }
+    self.upsert(uri, version, text)
+}
+
+fn *Server.on_change(params: *Json) with (a: mem.Allocator) {
+    var (doc, ok) = params.field("textDocument")
+    if !ok {
+        return
+    }
+    var (uri, uok) = doc.str_field("uri")
+    if !uok {
+        return
+    }
+    var version: i64 = 0
+    var (ver, vok) = doc.int_field("version")
+    if vok {
+        version = ver
+    }
+    var (changes, cok) = params.field("contentChanges")
+    if !cok || changes.kind != kind_arr {
+        return
+    }
+    var text = ""
+    var saw = false
+    var i: usize = 0
+    for i < changes.items.len {
+        var item = changes.items.get(i)
+        var (piece, pok) = item.str_field("text")
+        if pok {
+            text = piece
+            saw = true
+        }
+        i = i + 1
+    }
+    if saw {
+        self.upsert(uri, version, text)
+    }
+}
+
+fn *Server.on_close(params: *Json, out: *strbuilder.StrBuilder) with (a: mem.Allocator) {
+    var (doc, ok) = params.field("textDocument")
+    if !ok {
+        return
+    }
+    var (uri, uok) = doc.str_field("uri")
+    if !uok {
+        return
+    }
+    self.publish_empty(uri, out)
+    self.drop_doc(uri)
+    var kept: lists.List<str>
+    var i: usize = 0
+    for i < self.published.len {
+        val prev = self.published.get(i)
+        if prev != uri {
+            kept.push(copy_str(prev))
+        }
+        i = i + 1
+    }
+    free_strs(&self.published)
+    self.published = kept
+}
+
+fn *Server.on_rpc(root: *Json, out: *strbuilder.StrBuilder) with (a: mem.Allocator) {
+    if root.kind != kind_obj {
+        return
+    }
+    val has_id = root.has_key("id")
+    var (id, _) = root.field("id")
+    val has_method = root.has_key("method")
+    var (method, mok) = root.str_field("method")
+    if !has_method || !mok {
+        if has_id {
+            emit_error(out, &id, -32600, "invalid request")
+        }
+        return
+    }
+    if method == "exit" {
+        self.should_exit = true
+        if self.state == state_down {
+            self.exit_code = 0
+        } else {
+            self.exit_code = 1
+        }
+        return
+    }
+    if method == "initialize" {
+        if !has_id {
+            return
+        }
+        if self.state != state_new {
+            emit_error(out, &id, -32600, "invalid request")
+            return
+        }
+        self.state = state_run
+        var result = capabilities()
+        emit_result(out, &id, &result)
+        result.release()
+        return
+    }
+    if method == "shutdown" {
+        if !has_id {
+            return
+        }
+        if self.state == state_new {
+            emit_error(out, &id, -32002, "server not initialized")
+            return
+        }
+        if self.state != state_run {
+            emit_error(out, &id, -32600, "invalid request")
+            return
+        }
+        self.state = state_down
+        var result = j_null()
+        emit_result(out, &id, &result)
+        return
+    }
+    if method == "initialized" {
+        return
+    }
+    if self.state == state_new {
+        if has_id {
+            emit_error(out, &id, -32002, "server not initialized")
+        }
+        return
+    }
+    if self.state == state_down {
+        if has_id {
+            emit_error(out, &id, -32600, "invalid request")
+        }
+        return
+    }
+    var (params, _) = root.field("params")
+    if method == "textDocument/didOpen" {
+        self.on_open(&params)
+        return
+    }
+    if method == "textDocument/didChange" {
+        self.on_change(&params)
+        return
+    }
+    if method == "textDocument/didClose" {
+        self.on_close(&params, out)
+        return
+    }
+    if method == "textDocument/didSave" {
+        var (doc, dok) = params.field("textDocument")
+        if dok {
+            var (uri, uok) = doc.str_field("uri")
+            var (text, tok) = params.str_field("text")
+            if uok && tok {
+                var ignored = ""
+                var version: i64 = 0
+                var found = false
+                val (cur, ver, has) = self.text_of(uri)
+                ignored = cur
+                version = ver
+                found = has
+                if !found {
+                    version = 0
+                }
+                self.upsert(uri, version, text)
+            }
+            if uok {
+                self.on_save(uri, out)
+            }
+        }
+        return
+    }
+    if has_id {
+        emit_error(out, &id, -32601, "method not found")
+    }
+}
+
+fn *Server.dispatch(body: str, out: *strbuilder.StrBuilder) with (a: mem.Allocator) {
+    var (root, ok) = parse_document(body)
+    if !ok {
+        io.eprint("bad json\n")
+        return
+    }
+    self.on_rpc(&root, out)
+    root.release()
+}
+
+fn *Server.handle(body: str): str with (a: mem.Allocator) {
+    var out = strbuilder.empty()
+    self.dispatch(body, &out)
+    val text = copy_str(out.str())
+    out.free()
+    return text
+}

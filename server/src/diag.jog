@@ -1,0 +1,226 @@
+// Compiler diagnostics are one JSON object per line. Paths are normalized
+// to lowercase forward slashes so a Windows path matches the URI the
+// editor sent. file:// URIs are percent-decoded. A drive letter keeps a
+// single slash in the URI (file:///C:/...).
+
+import std.list as lists
+import std.mem
+import std.strbuilder
+
+struct Diag {
+    path: str
+    line: i64
+    column: i64
+    severity: str
+    message: str
+}
+
+fn *Diag.release() with (a: mem.Allocator) {
+    free_str(self.path)
+    free_str(self.severity)
+    free_str(self.message)
+    self.path = ""
+    self.severity = ""
+    self.message = ""
+}
+
+fn free_diags(xs: *lists.List<Diag>) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < xs.len {
+        var item = xs.get(i)
+        item.release()
+        i = i + 1
+    }
+    xs.free()
+}
+
+fn diag_from(v: *Json): (Diag, bool) with (a: mem.Allocator) {
+    var d = Diag()
+    val (file, fok) = v.str_field("file")
+    val (sev, sok) = v.str_field("severity")
+    val (msg, mok) = v.str_field("message")
+    val (line, lok) = v.int_field("line")
+    val (column, cok) = v.int_field("column")
+    if !fok || !sok || !mok || !lok || !cok {
+        return d, false
+    }
+    d.path = copy_str(file)
+    d.severity = copy_str(sev)
+    d.message = copy_str(msg)
+    d.line = line
+    d.column = column
+    return d, true
+}
+
+fn parse_diag_lines(text: str): (lists.List<Diag>, bool) with (a: mem.Allocator) {
+    var out: lists.List<Diag>
+    var start: usize = 0
+    var i: usize = 0
+    for i <= text.len {
+        val at_end = i == text.len
+        var is_nl = false
+        if !at_end && text.ptr[i] == '\n' as u8 {
+            is_nl = true
+        }
+        if at_end || is_nl {
+            var stop = i
+            if stop > start && text.ptr[stop - 1] == '\r' as u8 {
+                stop = stop - 1
+            }
+            if stop > start {
+                val line = view_range(text, start, stop)
+                var (value, ok) = parse_document(line)
+                if !ok {
+                    free_diags(&out)
+                    var empty: lists.List<Diag>
+                    return empty, false
+                }
+                var (d, dok) = diag_from(&value)
+                value.release()
+                if !dok {
+                    d.release()
+                    free_diags(&out)
+                    var empty: lists.List<Diag>
+                    return empty, false
+                }
+                out.push(d)
+            }
+            start = i + 1
+        }
+        if at_end {
+            break
+        }
+        i = i + 1
+    }
+    return out, true
+}
+
+fn severity_code(name: str): i64 {
+    if name == "error" {
+        return 1
+    }
+    if name == "warning" {
+        return 2
+    }
+    if name == "information" || name == "note" {
+        return 3
+    }
+    if name == "hint" {
+        return 4
+    }
+    return 1
+}
+
+fn is_uri_plain(c: u8): bool {
+    if c >= 'A' as u8 && c <= 'Z' as u8 {
+        return true
+    }
+    if c >= 'a' as u8 && c <= 'z' as u8 {
+        return true
+    }
+    if c >= '0' as u8 && c <= '9' as u8 {
+        return true
+    }
+    if c == '-' as u8 || c == '.' as u8 || c == '_' as u8 || c == '~' as u8 {
+        return true
+    }
+    if c == '/' as u8 || c == ':' as u8 {
+        return true
+    }
+    return false
+}
+
+fn norm_path(path: str): str with (a: mem.Allocator) {
+    var built = strbuilder.empty()
+    var i: usize = 0
+    for i < path.len {
+        val c = path.ptr[i]
+        if c == '\\' as u8 {
+            built.append_byte('/' as u8)
+        } else if c >= 'A' as u8 && c <= 'Z' as u8 {
+            built.append_byte(c + 32)
+        } else {
+            built.append_byte(c)
+        }
+        i = i + 1
+    }
+    val out = copy_str(built.str())
+    built.free()
+    return out
+}
+
+fn path_to_uri(path: str): str with (a: mem.Allocator) {
+    var built = strbuilder.empty()
+    built.append("file://")
+    if path.len >= 2 && path.ptr[1] == ':' as u8 {
+        built.append("/")
+    } else if path.len == 0 || path.ptr[0] != '/' as u8 {
+        built.append("/")
+    }
+    var i: usize = 0
+    for i < path.len {
+        val c = path.ptr[i]
+        if c == '\\' as u8 {
+            built.append("/")
+        } else if is_uri_plain(c) {
+            built.append_byte(c)
+        } else {
+            built.append("%")
+            built.append_byte(hex_char((c as u32) / 16))
+            built.append_byte(hex_char((c as u32) % 16))
+        }
+        i = i + 1
+    }
+    val out = copy_str(built.str())
+    built.free()
+    return out
+}
+
+fn take_hex(text: str, i: usize): (u8, bool) {
+    if i + 1 >= text.len {
+        return 0, false
+    }
+    val (hi, hok) = hex_digit(text.ptr[i])
+    val (lo, lok) = hex_digit(text.ptr[i + 1])
+    if !hok || !lok {
+        return 0, false
+    }
+    return ((hi * 16) + lo) as u8, true
+}
+
+fn uri_to_path(uri: str): (str, bool) with (a: mem.Allocator) {
+    var rest = uri
+    if starts_with(uri, "file://") {
+        rest = view_range(uri, 7, uri.len)
+    } else if starts_with(uri, "file:") {
+        return "", false
+    }
+    if starts_with(rest, "localhost/") {
+        rest = view_range(rest, 10, rest.len)
+    }
+    var built = strbuilder.empty()
+    var i: usize = 0
+    for i < rest.len {
+        val c = rest.ptr[i]
+        if c == '%' as u8 {
+            val (byte, ok) = take_hex(rest, i + 1)
+            if !ok {
+                built.free()
+                return "", false
+            }
+            built.append_byte(byte)
+            i = i + 3
+        } else {
+            built.append_byte(c)
+            i = i + 1
+        }
+    }
+    val decoded = copy_str(built.str())
+    built.free()
+    if decoded.len >= 3 && decoded.ptr[0] == '/' as u8 && decoded.ptr[2] == ':' as u8 {
+        val path = copy_str(view_range(decoded, 1, decoded.len))
+        free_str(decoded)
+        return path, true
+    }
+    return decoded, true
+}

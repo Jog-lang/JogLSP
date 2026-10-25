@@ -1,0 +1,40 @@
+import std.testing
+
+@test
+fn acute_before_column() with (t: testing.Testing) {
+    // é is C3 A9, then X. Byte index 2 is X, which is UTF-16 column 1.
+    var buf: [3]u8
+    buf[0] = 0xC3
+    buf[1] = 0xA9
+    buf[2] = 'X' as u8
+    val line = buf[0..3]
+    t.expect(utf16_column(line, 0) == 0)
+    t.expect(utf16_column(line, 2) == 1)
+    t.expect(utf16_column(line, 2) != 2)
+    t.expect(utf16_column(line, 3) == 2)
+}
+
+@test
+fn emoji_is_two_units() with (t: testing.Testing) {
+    var buf: [5]u8
+    buf[0] = 0xF0
+    buf[1] = 0x9F
+    buf[2] = 0x98
+    buf[3] = 0x80
+    buf[4] = 'x' as u8
+    val line = buf[0..5]
+    t.expect(utf16_column(line, 4) == 2)
+    t.expect(utf16_column(line, 4) != 4)
+    t.expect(utf16_column(line, 5) == 3)
+}
+
+@test
+fn lsp_range_is_zero_based() with (t: testing.Testing) {
+    val text = "éX\nnext"
+    val (line, start, end) = lsp_range(text, 1, 3)
+    t.expect(line == 0)
+    t.expect(start == 1)
+    t.expect(end == 2)
+    val (line2, _, _) = lsp_range(text, 2, 1)
+    t.expect(line2 == 1)
+}

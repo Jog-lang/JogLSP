@@ -1,0 +1,130 @@
+// Content-Length framing. A pipe read can stop in the middle of a header
+// or a body, or deliver several messages at once. read_frame reports
+// one message, or that the buffer must grow, or that the header is
+// nonsense. The length is bytes of the UTF-8 body. Names are matched
+// without regard to case. A body larger than 32 MiB is rejected.
+
+import std.mem
+import std.strbuilder
+
+val frame_ok: u8 = 0
+val frame_incomplete: u8 = 1
+val frame_bad: u8 = 2
+
+val frame_max: u64 = 33554432
+
+struct Frame {
+    status: u8
+    body_start: usize
+    body_len: usize
+    next: usize
+}
+
+fn write_frame(out: *strbuilder.StrBuilder, body: str) with (a: mem.Allocator) {
+    out.append("Content-Length: ")
+    out.append_int(body.len as i64, 10)
+    out.append("\r\n\r\n")
+    out.append(body)
+}
+
+fn lower_byte(c: u8): u8 {
+    if c >= 'A' as u8 && c <= 'Z' as u8 {
+        return c + 32
+    }
+    return c
+}
+
+fn has_name(buf: []u8, start: usize, end: usize, name: str): bool {
+    if end - start < name.len {
+        return false
+    }
+    var i: usize = 0
+    for i < name.len {
+        if lower_byte(buf[start + i]) != name.ptr[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn parse_length(buf: []u8, start: usize, end: usize): (usize, bool) {
+    var i = start
+    for i < end && buf[i] == ' ' as u8 {
+        i = i + 1
+    }
+    if i == end {
+        return 0, false
+    }
+    var n: u64 = 0
+    for i < end {
+        val c = buf[i]
+        if c < '0' as u8 || c > '9' as u8 {
+            return 0, false
+        }
+        val d = (c - '0' as u8) as u64
+        if n > (frame_max - d) / 10 {
+            return 0, false
+        }
+        n = n * 10 + d
+        i = i + 1
+    }
+    return n as usize, true
+}
+
+fn frame_incomplete_at(pos: usize): Frame {
+    return Frame(status: frame_incomplete, body_start: 0, body_len: 0, next: pos)
+}
+
+fn frame_bad_at(pos: usize): Frame {
+    return Frame(status: frame_bad, body_start: 0, body_len: 0, next: pos)
+}
+
+fn read_frame(buf: []u8, pos: usize): Frame {
+    val name = "content-length:"
+    var length: usize = 0
+    var have = false
+    var line = pos
+    for {
+        var end = line
+        for end + 1 < buf.len && !(buf[end] == '\r' as u8 && buf[end + 1] == '\n' as u8) {
+            end = end + 1
+        }
+        if end + 1 >= buf.len {
+            return frame_incomplete_at(pos)
+        }
+        if end == line {
+            val body = end + 2
+            if !have {
+                return frame_bad_at(pos)
+            }
+            if buf.len - body < length {
+                return frame_incomplete_at(pos)
+            }
+            return Frame(status: frame_ok, body_start: body, body_len: length, next: body + length)
+        }
+        if has_name(buf, line, end, name) {
+            val (n, ok) = parse_length(buf, line + name.len, end)
+            if !ok {
+                return frame_bad_at(pos)
+            }
+            length = n
+            have = true
+        }
+        line = end + 2
+    }
+}
+
+fn body_is(buf: []u8, f: Frame, want: str): bool {
+    if f.status != frame_ok || f.body_len != want.len {
+        return false
+    }
+    var i: usize = 0
+    for i < want.len {
+        if buf[f.body_start + i] != want.ptr[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}

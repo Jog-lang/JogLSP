@@ -1,0 +1,78 @@
+// Framing round trip. Two messages can arrive in one read. A header or
+// a body cut in half is incomplete, not a failed parse. Header names are
+// case-insensitive, and an extra header is ignored.
+
+import std.mem
+import std.strbuilder
+import std.testing
+
+fn builder_bytes(b: strbuilder.StrBuilder): []u8 {
+    var view: []u8
+    if b.len == 0 {
+        return view
+    }
+    view.ptr = b.ptr!!
+    view.len = b.len
+    return view
+}
+
+@test
+fn two_messages_in_one_read() with (t: testing.Testing) {
+    val first = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}"
+    val second = "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}"
+    var o = strbuilder.empty()
+    with (mem.heap()) {
+        write_frame(&o, first)
+        write_frame(&o, second)
+        val buf = builder_bytes(o)
+        val a = read_frame(buf, 0)
+        t.expect(body_is(buf, a, first))
+        val b = read_frame(buf, a.next)
+        t.expect(body_is(buf, b, second))
+        t.expect(b.next == o.len)
+        t.expect(read_frame(buf, b.next).status == frame_incomplete)
+        o.free()
+    }
+}
+
+@test
+fn partial_header_and_body() with (t: testing.Testing) {
+    var o = strbuilder.empty()
+    with (mem.heap()) {
+        write_frame(&o, "{\"method\":\"exit\"}")
+        val full = builder_bytes(o)
+        t.expect(read_frame(full, 0).status == frame_ok)
+        val cut_body = full[0..o.len - 3]
+        t.expect(read_frame(cut_body, 0).status == frame_incomplete)
+        val cut_header = full[0..10]
+        t.expect(read_frame(cut_header, 0).status == frame_incomplete)
+        o.free()
+    }
+}
+
+@test
+fn header_names_ignore_case() with (t: testing.Testing) {
+    var o = strbuilder.empty()
+    with (mem.heap()) {
+        o.append("Content-Type: application/vscode-jsonrpc; charset=utf-8\r\ncontent-length: 2\r\n\r\n{}")
+        val buf = builder_bytes(o)
+        t.expect(body_is(buf, read_frame(buf, 0), "{}"))
+        var missing = strbuilder.empty()
+        missing.append("Content-Type: x\r\n\r\n{}")
+        val bad = builder_bytes(missing)
+        t.expect(read_frame(bad, 0).status == frame_bad)
+        o.free()
+        missing.free()
+    }
+}
+
+@test
+fn length_too_large_is_bad() with (t: testing.Testing) {
+    var o = strbuilder.empty()
+    with (mem.heap()) {
+        o.append("Content-Length: 99999999\r\n\r\n")
+        val buf = builder_bytes(o)
+        t.expect(read_frame(buf, 0).status == frame_bad)
+        o.free()
+    }
+}

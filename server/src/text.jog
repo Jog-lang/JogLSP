@@ -1,0 +1,70 @@
+// Byte and string helpers for the server. copy_str allocates the exact
+// number of live bytes, so free_str can release that length. An empty
+// str is the static empty header and frees nothing. A view from
+// view_range aliases its source; the caller must not free it.
+
+import std.c
+import std.mem
+
+fn copy_str(text: str): str with (a: mem.Allocator) {
+    if text.len == 0 {
+        return ""
+    }
+    val (raw, err) = a.alloc(text.len, align(u8))
+    if err != null {
+        panic("out of memory")
+    }
+    c.memcpy(raw.ptr as *void, text.ptr as *const void, text.len)
+    return raw as str
+}
+
+fn free_str(text: str) with (a: mem.Allocator) {
+    if text.len == 0 {
+        return
+    }
+    var block = bytes()
+    block.ptr = text.ptr as *u8
+    block.len = text.len
+    a.free(block)
+}
+
+fn str_bytes(text: str): []u8 {
+    var view: []u8
+    if text.len == 0 {
+        return view
+    }
+    view.ptr = text.ptr as *u8
+    view.len = text.len
+    return view
+}
+
+fn starts_with(text: str, prefix: str): bool {
+    if text.len < prefix.len {
+        return false
+    }
+    var i: usize = 0
+    for i < prefix.len {
+        if text.ptr[i] != prefix.ptr[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn view_range(text: str, start: usize, end: usize): str {
+    if end < start || start > text.len {
+        return ""
+    }
+    var stop = end
+    if stop > text.len {
+        stop = text.len
+    }
+    if stop == start {
+        return ""
+    }
+    var view = bytes()
+    view.ptr = (text.ptr + start) as *u8
+    view.len = stop - start
+    return view
+}

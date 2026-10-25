@@ -1,0 +1,48 @@
+{
+  "name": "jog",
+  "displayName": "Jog",
+  "description": "Syntax highlighting and diagnostics for Jog",
+  "version": "0.0.1",
+  "publisher": "jog",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:jog"],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "jog",
+        "aliases": ["Jog", "jog"],
+        "extensions": [".jog"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "jog",
+        "scopeName": "source.jog",
+        "path": "./syntaxes/jog.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Jog",
+      "properties": {
+        "jog.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the Jog language server executable. Empty uses the bundled server, then server/out/server.exe in the JogLSP checkout."
+        },
+        "jog.compilerPath": {
+          "type": "string",
+          "default": "D:\\Projects\\CTools\\build\\jog.exe",
+          "description": "Path to jog.exe. The language server runs jog check --diag=json on save."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

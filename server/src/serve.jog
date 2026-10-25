@@ -1,0 +1,203 @@
+// The process loop. stdin and stdout are binary so a Content-Length
+// counts bytes on Windows. One read can hold several frames or half of
+// one; the tail stays at the front of the buffer. stdout is only frames.
+// The compiler path is argv[1], else JOG, else the stage-0 binary.
+
+import std.c
+import std.io
+import std.mem
+import std.os
+
+private extern {
+    fn _setmode(fd: c.int, mode: c.int): c.int
+    fn _fileno(stream: *c.FILE): c.int
+}
+
+struct InBuf {
+    ptr: *u8?
+    len: usize
+    cap: usize
+}
+
+fn *InBuf.reserve(n: usize) with (a: mem.Allocator) {
+    if self.cap >= n {
+        return
+    }
+    var cap: usize = 4096
+    if self.cap > 0 {
+        cap = self.cap
+    }
+    for cap < n {
+        cap = cap * 2
+    }
+    val (raw, err) = a.alloc(cap, align(u8))
+    if err != null {
+        panic("out of memory")
+    }
+    if self.len > 0 {
+        c.memcpy(raw.ptr as *void, self.ptr!! as *const void, self.len)
+    }
+    if self.cap > 0 {
+        var block = bytes()
+        block.ptr = self.ptr!!
+        block.len = self.cap
+        a.free(block)
+    }
+    self.ptr = raw.ptr as *u8?
+    self.cap = cap
+}
+
+fn *InBuf.shift(drop: usize) {
+    if drop == 0 || self.ptr == null {
+        return
+    }
+    if drop >= self.len {
+        self.len = 0
+        return
+    }
+    val rest = self.len - drop
+    var i: usize = 0
+    for i < rest {
+        self.ptr!![i] = self.ptr!![drop + i]
+        i = i + 1
+    }
+    self.len = rest
+}
+
+fn read_stdin(dst: *u8, cap: usize): usize {
+    if cap == 0 {
+        return 0
+    }
+    val stream = c.jogrt_stdin()
+    if stream == null {
+        return 0
+    }
+    return c.fread(dst as *void, 1, cap, stream!! as *c.FILE)
+}
+
+fn *InBuf.pull(): bool with (a: mem.Allocator) {
+    self.reserve(self.len + 4096)
+    if self.ptr == null {
+        return false
+    }
+    val n = read_stdin(self.ptr!! + self.len, self.cap - self.len)
+    if n == 0 {
+        return false
+    }
+    self.len = self.len + n
+    return true
+}
+
+fn *InBuf.live(): []u8 {
+    var view: []u8
+    if self.len == 0 || self.ptr == null {
+        return view
+    }
+    view.ptr = self.ptr!!
+    view.len = self.len
+    return view
+}
+
+fn *InBuf.release() with (a: mem.Allocator) {
+    if self.cap == 0 || self.ptr == null {
+        return
+    }
+    var block = bytes()
+    block.ptr = self.ptr!!
+    block.len = self.cap
+    a.free(block)
+    self.ptr = null
+    self.len = 0
+    self.cap = 0
+}
+
+fn write_stdout(text: str): bool {
+    if text.len == 0 {
+        return true
+    }
+    return c.jogrt_write(1, text.ptr as *const void?, text.len)
+}
+
+fn set_binary_io() {
+    val inn = c.jogrt_stdin()
+    val out = c.jogrt_stdout()
+    if inn != null {
+        _setmode(_fileno(inn!! as *c.FILE), 0x8000)
+    }
+    if out != null {
+        _setmode(_fileno(out!! as *c.FILE), 0x8000)
+    }
+}
+
+fn resolve_jog(): str with (a: mem.Allocator) {
+    if os.argc() >= 2 {
+        return copy_str(os.argv(1))
+    }
+    var (env, ok) = os.env("JOG")
+    if ok && env.len > 0 {
+        return copy_str(env)
+    }
+    return copy_str("D:/Projects/CTools/build/jog.exe")
+}
+
+fn buf_as_str(buf: []u8): str {
+    var view = bytes()
+    if buf.len == 0 {
+        return ""
+    }
+    view.ptr = buf.ptr
+    view.len = buf.len
+    return view
+}
+
+fn serve() with (a: mem.Allocator) {
+    set_binary_io()
+    var jog = resolve_jog()
+    var srv = server_new(jog)
+    free_str(jog)
+    var buf = InBuf()
+    for !srv.should_exit {
+        var pos: usize = 0
+        var advanced = false
+        for {
+            val view = buf.live()
+            val frame = read_frame(view, pos)
+            if frame.status == frame_incomplete {
+                break
+            }
+            if frame.status == frame_bad {
+                io.eprint("bad frame\n")
+                buf.len = 0
+                pos = 0
+                advanced = false
+                break
+            }
+            val span = view_range(buf_as_str(view), frame.body_start, frame.body_start + frame.body_len)
+            val body = copy_str(span)
+            val out = srv.handle(body)
+            free_str(body)
+            if out.len > 0 {
+                write_stdout(out)
+            }
+            free_str(out)
+            pos = frame.next
+            advanced = true
+            if srv.should_exit {
+                break
+            }
+        }
+        if srv.should_exit {
+            break
+        }
+        if advanced && pos > 0 {
+            buf.shift(pos)
+        }
+        if !buf.pull() {
+            break
+        }
+    }
+    val code = srv.exit_code
+    srv.release()
+    buf.release()
+    c.jogrt_exit(code)
+}

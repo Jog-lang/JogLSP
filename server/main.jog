@@ -1,0 +1,8 @@
+import src
+import std.mem
+
+fn main() {
+    with (mem.heap()) {
+        src.serve()
+    }
+}

@@ -1,0 +1,65 @@
+{
+  "scopeName": "source.jog",
+  "name": "Jog",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#string" },
+    { "include": "#function" },
+    { "include": "#keyword" },
+    { "include": "#number" }
+  ],
+  "repository": {
+    "comment": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.jog",
+          "match": "//.*"
+        },
+        {
+          "name": "comment.block.jog",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "string": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.jog",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            { "name": "constant.character.escape.jog", "match": "\\\\." }
+          ]
+        },
+        {
+          "name": "string.quoted.other.raw.jog",
+          "begin": "`",
+          "end": "`"
+        },
+        {
+          "name": "string.quoted.other.c.jog",
+          "begin": "\\bc\"",
+          "end": "\"",
+          "patterns": [
+            { "name": "constant.character.escape.jog", "match": "\\\\." }
+          ]
+        }
+      ]
+    },
+    "function": {
+      "match": "\\bfn\\s+(?:\\*\\s*)?(?:[A-Za-z_][A-Za-z0-9_]*\\s*\\.)?([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "entity.name.function.jog" }
+      }
+    },
+    "keyword": {
+      "match": "\\b(fn|var|val|type|struct|interface|enum|if|else|when|for|in|break|continue|return|defer|errdefer|go|with|context|private|import|as|is|null|true|false|bytes|op|escaping|const|extern)\\b",
+      "name": "keyword.control.jog"
+    },
+    "number": {
+      "match": "\\b(?:0[xX][0-9A-Fa-f_]+|0[bB][01_]+|0[oO][0-7_]+|[0-9][0-9_]*(?:\\.[0-9_]+)?(?:[eE][+-]?[0-9_]+)?)\\b",
+      "name": "constant.numeric.jog"
+    }
+  }
+}

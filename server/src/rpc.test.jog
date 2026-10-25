@@ -1,0 +1,309 @@
+import std.c
+import std.fs
+import std.list as lists
+import std.mem
+import std.strbuilder
+import std.testing
+
+val jog_bin = "D:/Projects/CTools/build/jog.exe"
+
+fn rpc_body(method: str, id: i64, has_id: bool, params: Json): str with (a: mem.Allocator) {
+    var msg = j_obj()
+    msg.put_str("jsonrpc", "2.0")
+    msg.put_str("method", method)
+    if has_id {
+        msg.put("id", j_int(id))
+    }
+    msg.put("params", params)
+    var raw = strbuilder.empty()
+    write_json(&msg, &raw)
+    val text = copy_str(raw.str())
+    raw.free()
+    msg.release()
+    return text
+}
+
+fn read_response(framed: str): (Json, bool) with (a: mem.Allocator) {
+    val buf = str_bytes(framed)
+    val frame = read_frame(buf, 0)
+    if frame.status != frame_ok {
+        return Json(), false
+    }
+    val body = copy_str(view_range(framed, frame.body_start, frame.body_start + frame.body_len))
+    var (root, ok) = parse_document(body)
+    free_str(body)
+    if !ok {
+        return Json(), false
+    }
+    return root, true
+}
+
+fn error_code(root: *Json): (i64, bool) {
+    var (err, ok) = root.field("error")
+    if !ok {
+        return 0, false
+    }
+    return err.int_field("code")
+}
+
+fn cstr_ok(path: str, buf: *u8, cap: usize): bool {
+    if path.len >= cap {
+        return false
+    }
+    if path.len > 0 {
+        c.memcpy(buf as *void, path.ptr as *const void, path.len)
+    }
+    buf[path.len] = 0
+    return true
+}
+
+fn make_dir(path: str): bool {
+    var buf: [4096]u8
+    if !cstr_ok(path, buf[..].ptr, 4096) {
+        return false
+    }
+    return c.CreateDirectoryA(buf[..].ptr as *const c.char, 0) != 0
+}
+
+fn delete_path(path: str) {
+    var buf: [4096]u8
+    if !cstr_ok(path, buf[..].ptr, 4096) {
+        return
+    }
+    c.DeleteFileA(buf[..].ptr as *const c.char)
+    c.RemoveDirectoryA(buf[..].ptr as *const c.char)
+}
+
+fn text_bytes(text: str): bytes {
+    var data = bytes()
+    data.ptr = text.ptr as *u8
+    data.len = text.len
+    return data
+}
+
+fn scratch_dir(): str with (a: mem.Allocator) {
+    var buf: bytes[512]
+    val n = c.GetTempPathA(512, buf[..].ptr as *c.char)
+    if n == 0 || (n as usize) >= 512 {
+        return ""
+    }
+    var raw = bytes()
+    raw.ptr = buf[..].ptr
+    raw.len = n as usize
+    val temp = copy_str(raw as str)
+    val dir = fs.join(temp, "jog-lsp-p2")
+    free_str(temp)
+    return dir
+}
+
+@test
+fn uri_encodes_space() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val uri = path_to_uri("C:\\Jog\\a b.jog")
+        t.expect(uri == "file:///C:/Jog/a%20b.jog")
+        var (path, ok) = uri_to_path(uri)
+        t.expect(ok)
+        t.expect(path == "C:/Jog/a b.jog")
+        val norm = norm_path("C:\\Jog\\A.jog")
+        t.expect(norm == "c:/jog/a.jog")
+        free_str(uri)
+        free_str(path)
+        free_str(norm)
+    }
+}
+
+@test
+fn lifecycle_and_bad_messages() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var early = server_new(jog_bin)
+        val shut = rpc_body("shutdown", 1, true, j_obj())
+        val shut_out = early.handle(shut)
+        var (shut_root, shut_ok) = read_response(shut_out)
+        t.expect(shut_ok)
+        var (shut_code, _) = error_code(&shut_root)
+        t.expect(shut_code == -32002)
+        shut_root.release()
+        free_str(shut_out)
+        free_str(shut)
+        val exit_early = rpc_body("exit", 0, false, j_obj())
+        val exit_out = early.handle(exit_early)
+        t.expect(exit_out.len == 0)
+        t.expect(early.should_exit)
+        t.expect(early.exit_code == 1)
+        free_str(exit_out)
+        free_str(exit_early)
+        early.release()
+
+        var srv = server_new(jog_bin)
+        val junk = srv.handle("{")
+        t.expect(junk.len == 0)
+        free_str(junk)
+        val init = rpc_body("initialize", 7, true, j_obj())
+        val init_out = srv.handle(init)
+        var (root, ok) = read_response(init_out)
+        t.expect(ok)
+        var (result, rok) = root.field("result")
+        t.expect(rok)
+        var (caps, cok) = result.field("capabilities")
+        t.expect(cok)
+        t.expect(caps.has_key("textDocumentSync"))
+        root.release()
+        free_str(init_out)
+        free_str(init)
+
+        val missing = "{\"jsonrpc\":\"2.0\",\"id\":3}"
+        val missing_out = srv.handle(missing)
+        var (miss, mok) = read_response(missing_out)
+        t.expect(mok)
+        var (miss_code, mck) = error_code(&miss)
+        t.expect(mck)
+        t.expect(miss_code == -32600)
+        miss.release()
+        free_str(missing_out)
+
+        val nope = rpc_body("textDocument/hover", 4, true, j_obj())
+        val nope_out = srv.handle(nope)
+        var (nope_root, nok) = read_response(nope_out)
+        t.expect(nok)
+        var (nope_code, nck) = error_code(&nope_root)
+        t.expect(nck)
+        t.expect(nope_code == -32601)
+        nope_root.release()
+        free_str(nope_out)
+        free_str(nope)
+
+        val down = rpc_body("shutdown", 8, true, j_obj())
+        val down_out = srv.handle(down)
+        var (down_root, dok) = read_response(down_out)
+        t.expect(dok)
+        var (down_result, drk) = down_root.field("result")
+        t.expect(drk)
+        t.expect(down_result.kind == kind_null)
+        down_root.release()
+        free_str(down_out)
+        free_str(down)
+
+        val late = rpc_body("initialize", 9, true, j_obj())
+        val late_out = srv.handle(late)
+        var (late_root, lok) = read_response(late_out)
+        t.expect(lok)
+        var (late_code, lck) = error_code(&late_root)
+        t.expect(lck)
+        t.expect(late_code == -32600)
+        late_root.release()
+        free_str(late_out)
+        free_str(late)
+
+        val done = rpc_body("exit", 0, false, j_obj())
+        val done_out = srv.handle(done)
+        t.expect(done_out.len == 0)
+        t.expect(srv.exit_code == 0)
+        free_str(done_out)
+        free_str(done)
+        srv.release()
+    }
+}
+
+@test
+fn save_publishes_and_clears() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val dir = scratch_dir()
+        t.expect(dir.len > 0)
+        make_dir(dir)
+        val mod = fs.join(dir, "jog.mod")
+        val file = fs.join(dir, "bad.jog")
+        val src = "fn main() {\n    val n: i32 = \"é\" + 1\n}\n"
+        t.expect(fs.write_all(mod, text_bytes("module fixture\n")))
+        t.expect(fs.write_all(file, text_bytes(src)))
+        val uri = path_to_uri(file)
+        var srv = server_new(jog_bin)
+        val init = rpc_body("initialize", 1, true, j_obj())
+        val init_out = srv.handle(init)
+        free_str(init_out)
+        free_str(init)
+        var doc = j_obj()
+        doc.put_str("uri", uri)
+        doc.put_str("languageId", "jog")
+        doc.put_int("version", 1)
+        doc.put_str("text", src)
+        var open_params = j_obj()
+        open_params.put("textDocument", doc)
+        val opened = rpc_body("textDocument/didOpen", 0, false, open_params)
+        val open_out = srv.handle(opened)
+        t.expect(open_out.len == 0)
+        free_str(open_out)
+        free_str(opened)
+        var save_doc = j_obj()
+        save_doc.put_str("uri", uri)
+        var save_params = j_obj()
+        save_params.put("textDocument", save_doc)
+        val saved = rpc_body("textDocument/didSave", 0, false, save_params)
+        val saved_out = srv.handle(saved)
+        var (pub, pok) = read_response(saved_out)
+        t.expect(pok)
+        var (method, mok) = pub.str_field("method")
+        t.expect(mok)
+        t.expect(method == "textDocument/publishDiagnostics")
+        var (params, pak) = pub.field("params")
+        t.expect(pak)
+        var (items, iok) = params.field("diagnostics")
+        t.expect(iok)
+        t.expect(items.kind == kind_arr)
+        t.expect(items.items.len > 0)
+        var diag = items.items.get(0)
+        var (range, rok) = diag.field("range")
+        var (start, sok) = range.field("start")
+        var (character, cok) = start.int_field("character")
+        t.expect(rok && sok && cok)
+        val line = "    val n: i32 = \"é\" + 1"
+        val expect = utf16_column(str_bytes(line), 22) as i64
+        t.expect(character == expect)
+        t.expect(character != 22)
+        var (message, msg_ok) = diag.str_field("message")
+        t.expect(msg_ok)
+        t.expect(message == "mismatched types str and i64")
+        pub.release()
+        free_str(saved_out)
+        free_str(saved)
+
+        val clean = "fn main() {\n}\n"
+        t.expect(fs.write_all(file, text_bytes(clean)))
+        var changed = j_obj()
+        changed.put_str("text", clean)
+        var changes = j_arr()
+        changes.items.push(changed)
+        var change_doc = j_obj()
+        change_doc.put_str("uri", uri)
+        change_doc.put_int("version", 2)
+        var change_params = j_obj()
+        change_params.put("textDocument", change_doc)
+        change_params.put("contentChanges", changes)
+        val edited = rpc_body("textDocument/didChange", 0, false, change_params)
+        val edit_out = srv.handle(edited)
+        free_str(edit_out)
+        free_str(edited)
+        var again_doc = j_obj()
+        again_doc.put_str("uri", uri)
+        var again_params = j_obj()
+        again_params.put("textDocument", again_doc)
+        val again = rpc_body("textDocument/didSave", 0, false, again_params)
+        val again_out = srv.handle(again)
+        var (cleared, clr_ok) = read_response(again_out)
+        t.expect(clr_ok)
+        var (cparams, cp_ok) = cleared.field("params")
+        var (citems, ci_ok) = cparams.field("diagnostics")
+        t.expect(cp_ok && ci_ok)
+        t.expect(citems.items.len == 0)
+        cleared.release()
+        free_str(again_out)
+        free_str(again)
+        srv.release()
+        free_str(uri)
+        delete_path(file)
+        delete_path(mod)
+        delete_path(dir)
+        free_str(file)
+        free_str(mod)
+        free_str(dir)
+    }
+}

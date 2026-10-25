@@ -1,0 +1,198 @@
+import std.fs
+import std.list as lists
+import std.mem
+import std.os
+import std.strbuilder
+import std.testing
+
+fn parent_path(path: str): str with (a: mem.Allocator) {
+    var i = path.len
+    for i > 0 {
+        i = i - 1
+        val c = path.ptr[i]
+        if c == '/' as u8 || c == '\\' as u8 {
+            return copy_str(view_range(path, 0, i))
+        }
+    }
+    return ""
+}
+
+fn has_suffix(text: str, suffix: str): bool {
+    if text.len < suffix.len {
+        return false
+    }
+    return view_range(text, text.len - suffix.len, text.len) == suffix
+}
+
+fn corpus_dir(name: str): str with (a: mem.Allocator) {
+    val exe = os.argv(0)
+    val out_dir = parent_path(exe)
+    val root = parent_path(out_dir)
+    val data = fs.join(root, "testdata")
+    val json = fs.join(data, "json")
+    val dir = fs.join(json, name)
+    free_str(data)
+    free_str(json)
+    free_str(out_dir)
+    free_str(root)
+    return dir
+}
+
+fn round_trip_file(path: str): bool with (t: testing.Testing, a: mem.Allocator) {
+    var (data, ok) = fs.read_all(path)
+    if !ok {
+        t.fail(path)
+        return false
+    }
+    val text: str = data
+    var (first, fok) = parse_document(text)
+    if !fok {
+        a.free(data)
+        t.fail(path)
+        return false
+    }
+    var built = strbuilder.empty()
+    write_json(&first, &built)
+    var (second, sok) = parse_document(built.str())
+    val same = sok && json_eq(&first, &second)
+    if sok {
+        second.release()
+    }
+    first.release()
+    built.free()
+    a.free(data)
+    if !same {
+        t.fail(path)
+    }
+    return same
+}
+
+fn rejects_file(path: str): bool with (t: testing.Testing, a: mem.Allocator) {
+    var (data, ok) = fs.read_all(path)
+    if !ok {
+        t.fail(path)
+        return false
+    }
+    val text: str = data
+    var (value, pok) = parse_document(text)
+    if pok {
+        value.release()
+        a.free(data)
+        t.fail(path)
+        return false
+    }
+    a.free(data)
+    return true
+}
+
+fn each_json(dir: str, valid: bool) with (t: testing.Testing, a: mem.Allocator) {
+    var (names, ok) = fs.list(dir)
+    if !ok {
+        t.fail(dir)
+        return
+    }
+    var i: usize = 0
+    for i < names.len {
+        val name = names.get(i)
+        if has_suffix(name, ".json") {
+            val path = fs.join(dir, name)
+            if valid {
+                round_trip_file(path)
+            } else {
+                rejects_file(path)
+            }
+            free_str(path)
+        }
+        i = i + 1
+    }
+    fs.free_names(&names)
+}
+
+@test
+fn valid_corpus_round_trips() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val dir = corpus_dir("valid")
+        each_json(dir, true)
+        free_str(dir)
+    }
+}
+
+@test
+fn invalid_corpus_is_rejected() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val dir = corpus_dir("invalid")
+        each_json(dir, false)
+        free_str(dir)
+    }
+}
+
+@test
+fn surrogate_pair_is_utf8() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var (emoji, ok) = parse_document("\"\\uD83D\\uDE00\"")
+        t.expect(ok)
+        t.expect(emoji.kind == kind_str)
+        t.expect(emoji.text.len == 4)
+        t.expect(emoji.text.ptr[0] == 0xF0)
+        t.expect(emoji.text.ptr[1] == 0x9F)
+        t.expect(emoji.text.ptr[2] == 0x98)
+        t.expect(emoji.text.ptr[3] == 0x80)
+        emoji.release()
+        var (e, eok) = parse_document("\"\\u00E9\"")
+        t.expect(eok)
+        t.expect(e.text.len == 2)
+        t.expect(e.text.ptr[0] == 0xC3)
+        t.expect(e.text.ptr[1] == 0xA9)
+        e.release()
+        var (lone, lok) = parse_document("\"\\uD800\"")
+        t.expect(!lok)
+        if lok {
+            lone.release()
+        }
+        var (bad, bok) = parse_document("\"\\uD800\\u0041\"")
+        t.expect(!bok)
+        if bok {
+            bad.release()
+        }
+    }
+}
+
+fn reject_doc(text: str) with (t: testing.Testing, a: mem.Allocator) {
+    var (value, ok) = parse_document(text)
+    t.expect(!ok)
+    if ok {
+        value.release()
+    }
+}
+
+@test
+fn inline_invalid_does_not_crash() with (t: testing.Testing) {
+    with (mem.heap()) {
+        reject_doc("[1,]")
+        reject_doc("{\"a\":1,}")
+        reject_doc("\"\\q\"")
+        reject_doc("\"abc")
+        reject_doc("+1")
+        reject_doc("01")
+        reject_doc("")
+        reject_doc("true false")
+        reject_doc("[")
+        var deep = strbuilder.empty()
+        var n: usize = 0
+        for n < 80 {
+            deep.append("[")
+            n = n + 1
+        }
+        n = 0
+        for n < 80 {
+            deep.append("]")
+            n = n + 1
+        }
+        var (value, ok) = parse_document(deep.str())
+        t.expect(!ok)
+        if ok {
+            value.release()
+        }
+        deep.free()
+    }
+}

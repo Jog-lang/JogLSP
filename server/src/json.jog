@@ -1,0 +1,672 @@
+// A small JSON parser and writer. Documents are RFC 8259: no trailing
+// commas, no leading zeros, no bare controls in strings. \u escapes,
+// including a surrogate pair, decode to UTF-8. Nesting deeper than 64
+// is rejected. Strings and number literals are owned copies; release
+// frees the tree once. A value copied by field or List.get shares those
+// blocks, so only the owner is released.
+
+import std.list as lists
+import std.mem
+import std.strbuilder
+
+val kind_null: u8 = 0
+val kind_bool: u8 = 1
+val kind_num: u8 = 2
+val kind_str: u8 = 3
+val kind_arr: u8 = 4
+val kind_obj: u8 = 5
+
+val json_max_depth: usize = 64
+
+struct Json {
+    kind: u8
+    flag: bool
+    int_ok: bool
+    int_val: i64
+    text: str
+    items: lists.List<Json>
+    keys: lists.List<str>
+}
+
+struct Parser {
+    buf: []u8
+    at: usize
+    depth: usize
+}
+
+fn j_null(): Json {
+    return Json()
+}
+
+fn j_bool(v: bool): Json {
+    var out = Json()
+    out.kind = kind_bool
+    out.flag = v
+    return out
+}
+
+fn j_int(n: i64): Json {
+    var out = Json()
+    out.kind = kind_num
+    out.int_ok = true
+    out.int_val = n
+    return out
+}
+
+fn j_str_owned(text: str): Json {
+    var out = Json()
+    out.kind = kind_str
+    out.text = text
+    return out
+}
+
+fn j_str(text: str): Json with (a: mem.Allocator) {
+    return j_str_owned(copy_str(text))
+}
+
+fn j_arr(): Json {
+    var out = Json()
+    out.kind = kind_arr
+    return out
+}
+
+fn j_obj(): Json {
+    var out = Json()
+    out.kind = kind_obj
+    return out
+}
+
+fn *Json.release() with (a: mem.Allocator) {
+    if self.kind == kind_str || self.kind == kind_num {
+        free_str(self.text)
+        self.text = ""
+    }
+    var i: usize = 0
+    for i < self.keys.len {
+        free_str(self.keys.get(i))
+        i = i + 1
+    }
+    i = 0
+    for i < self.items.len {
+        var child = self.items.get(i)
+        child.release()
+        i = i + 1
+    }
+    self.keys.free()
+    self.items.free()
+    self.kind = kind_null
+}
+
+fn *Json.put(key: str, value: Json) with (a: mem.Allocator) {
+    self.keys.push(copy_str(key))
+    self.items.push(value)
+}
+
+fn *Json.put_str(key: str, text: str) with (a: mem.Allocator) {
+    self.put(key, j_str(text))
+}
+
+fn *Json.put_int(key: str, n: i64) with (a: mem.Allocator) {
+    self.put(key, j_int(n))
+}
+
+fn *Json.put_bool(key: str, v: bool) with (a: mem.Allocator) {
+    self.put(key, j_bool(v))
+}
+
+fn *Json.field(key: str): (Json, bool) {
+    if self.kind != kind_obj {
+        return Json(), false
+    }
+    var i = self.keys.len
+    for i > 0 {
+        i = i - 1
+        if self.keys.get(i) == key {
+            return self.items.get(i), true
+        }
+    }
+    return Json(), false
+}
+
+fn *Json.has_key(key: str): bool {
+    val (_, ok) = self.field(key)
+    return ok
+}
+
+fn *Json.str_field(key: str): (str, bool) {
+    val (v, ok) = self.field(key)
+    if !ok || v.kind != kind_str {
+        return "", false
+    }
+    return v.text, true
+}
+
+fn *Json.int_field(key: str): (i64, bool) {
+    val (v, ok) = self.field(key)
+    if !ok || v.kind != kind_num || !v.int_ok {
+        return 0, false
+    }
+    return v.int_val, true
+}
+
+fn json_eq(a: *Json, b: *Json): bool {
+    if a.kind != b.kind {
+        return false
+    }
+    if a.kind == kind_null {
+        return true
+    }
+    if a.kind == kind_bool {
+        return a.flag == b.flag
+    }
+    if a.kind == kind_num {
+        if a.text.len > 0 || b.text.len > 0 {
+            return a.text == b.text
+        }
+        return a.int_ok && b.int_ok && a.int_val == b.int_val
+    }
+    if a.kind == kind_str {
+        return a.text == b.text
+    }
+    if a.items.len != b.items.len || a.keys.len != b.keys.len {
+        return false
+    }
+    var i: usize = 0
+    for i < a.items.len {
+        if a.kind == kind_obj && a.keys.get(i) != b.keys.get(i) {
+            return false
+        }
+        var left = a.items.get(i)
+        var right = b.items.get(i)
+        if !json_eq(&left, &right) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn hex_char(d: u32): u8 {
+    if d < 10 {
+        return (('0' as u32) + d) as u8
+    }
+    return (('a' as u32) + (d - 10)) as u8
+}
+
+fn write_string(text: str, out: *strbuilder.StrBuilder) with (a: mem.Allocator) {
+    out.append("\"")
+    var i: usize = 0
+    for i < text.len {
+        val c = text.ptr[i]
+        if c == '"' as u8 {
+            out.append("\\\"")
+        } else if c == '\\' as u8 {
+            out.append("\\\\")
+        } else if c == '\n' as u8 {
+            out.append("\\n")
+        } else if c == '\r' as u8 {
+            out.append("\\r")
+        } else if c == '\t' as u8 {
+            out.append("\\t")
+        } else if c == 0x08 {
+            out.append("\\b")
+        } else if c == 0x0C {
+            out.append("\\f")
+        } else if c < 0x20 {
+            out.append("\\u00")
+            out.append_byte(hex_char((c as u32) / 16))
+            out.append_byte(hex_char((c as u32) % 16))
+        } else {
+            out.append_byte(c)
+        }
+        i = i + 1
+    }
+    out.append("\"")
+}
+
+fn write_json(v: *Json, out: *strbuilder.StrBuilder) with (a: mem.Allocator) {
+    if v.kind == kind_null {
+        out.append("null")
+        return
+    }
+    if v.kind == kind_bool {
+        if v.flag {
+            out.append("true")
+        } else {
+            out.append("false")
+        }
+        return
+    }
+    if v.kind == kind_num {
+        if v.text.len > 0 {
+            out.append(v.text)
+        } else {
+            out.append_int(v.int_val, 10)
+        }
+        return
+    }
+    if v.kind == kind_str {
+        write_string(v.text, out)
+        return
+    }
+    if v.kind == kind_arr {
+        out.append("[")
+        var i: usize = 0
+        for i < v.items.len {
+            if i > 0 {
+                out.append(",")
+            }
+            var elem = v.items.get(i)
+            write_json(&elem, out)
+            i = i + 1
+        }
+        out.append("]")
+        return
+    }
+    out.append("{")
+    var i: usize = 0
+    for i < v.keys.len {
+        if i > 0 {
+            out.append(",")
+        }
+        write_string(v.keys.get(i), out)
+        out.append(":")
+        var elem = v.items.get(i)
+        write_json(&elem, out)
+        i = i + 1
+    }
+    out.append("}")
+}
+
+fn hex_digit(c: u8): (u32, bool) {
+    if c >= '0' as u8 && c <= '9' as u8 {
+        return (c as u32) - ('0' as u32), true
+    }
+    if c >= 'a' as u8 && c <= 'f' as u8 {
+        return (c as u32) - ('a' as u32) + 10, true
+    }
+    if c >= 'A' as u8 && c <= 'F' as u8 {
+        return (c as u32) - ('A' as u32) + 10, true
+    }
+    return 0, false
+}
+
+fn *Parser.peek(): (u8, bool) {
+    if self.at >= self.buf.len {
+        return 0, false
+    }
+    return self.buf[self.at], true
+}
+
+fn *Parser.skip() {
+    for self.at < self.buf.len {
+        val c = self.buf[self.at]
+        if c != ' ' as u8 && c != '\t' as u8 && c != '\n' as u8 && c != '\r' as u8 {
+            return
+        }
+        self.at = self.at + 1
+    }
+}
+
+fn *Parser.eat(c: u8): bool {
+    val (got, ok) = self.peek()
+    if !ok || got != c {
+        return false
+    }
+    self.at = self.at + 1
+    return true
+}
+
+fn pair_cp(high: i64, low: i64): i64 {
+    return 0x10000 + ((high - 0xD800) * 1024) + (low - 0xDC00)
+}
+
+fn *Parser.read_hex4(): (i64, bool) {
+    var cp: i64 = 0
+    var k: usize = 0
+    for k < 4 {
+        val (c, ok) = self.peek()
+        if !ok {
+            return 0, false
+        }
+        val (d, dok) = hex_digit(c)
+        if !dok {
+            return 0, false
+        }
+        self.at = self.at + 1
+        cp = (cp * 16) + (d as i64)
+        k = k + 1
+    }
+    return cp, true
+}
+
+fn *Parser.parse_string(): (str, bool) with (a: mem.Allocator) {
+    if !self.eat('"' as u8) {
+        return "", false
+    }
+    var built = strbuilder.empty()
+    for {
+        val (c, ok) = self.peek()
+        if !ok {
+            built.free()
+            return "", false
+        }
+        self.at = self.at + 1
+        if c == '"' as u8 {
+            val owned = copy_str(built.str())
+            built.free()
+            return owned, true
+        }
+        if c == '\\' as u8 {
+            val (esc, eok) = self.peek()
+            if !eok {
+                built.free()
+                return "", false
+            }
+            self.at = self.at + 1
+            if esc == '"' as u8 || esc == '\\' as u8 || esc == '/' as u8 {
+                built.append_byte(esc)
+            } else if esc == 'b' as u8 {
+                built.append_byte(0x08)
+            } else if esc == 'f' as u8 {
+                built.append_byte(0x0C)
+            } else if esc == 'n' as u8 {
+                built.append_byte('\n' as u8)
+            } else if esc == 'r' as u8 {
+                built.append_byte('\r' as u8)
+            } else if esc == 't' as u8 {
+                built.append_byte('\t' as u8)
+            } else if esc == 'u' as u8 {
+                val (cp, cok) = self.read_hex4()
+                if !cok || cp < 0 || cp > 0x10FFFF {
+                    built.free()
+                    return "", false
+                }
+                if cp >= 0xD800 && cp <= 0xDBFF {
+                    if !self.eat('\\' as u8) || !self.eat('u' as u8) {
+                        built.free()
+                        return "", false
+                    }
+                    val (low, lok) = self.read_hex4()
+                    if !lok || low < 0xDC00 || low > 0xDFFF {
+                        built.free()
+                        return "", false
+                    }
+                    built.append_char(pair_cp(cp, low))
+                } else if cp >= 0xDC00 && cp <= 0xDFFF {
+                    built.free()
+                    return "", false
+                } else {
+                    built.append_char(cp)
+                }
+            } else {
+                built.free()
+                return "", false
+            }
+        } else if c < 0x20 {
+            built.free()
+            return "", false
+        } else {
+            built.append_byte(c)
+        }
+    }
+}
+
+fn *Parser.parse_literal(word: str): bool {
+    var i: usize = 0
+    for i < word.len {
+        val (c, ok) = self.peek()
+        if !ok || c != word.ptr[i] {
+            return false
+        }
+        self.at = self.at + 1
+        i = i + 1
+    }
+    return true
+}
+
+fn *Parser.scan_number(): (Json, bool) with (a: mem.Allocator) {
+    val start = self.at
+    var integer = true
+    self.eat('-' as u8)
+    val (first, fok) = self.peek()
+    if !fok || first < '0' as u8 || first > '9' as u8 {
+        return Json(), false
+    }
+    self.at = self.at + 1
+    if first == '0' as u8 {
+        val (next, nok) = self.peek()
+        if nok && next >= '0' as u8 && next <= '9' as u8 {
+            return Json(), false
+        }
+    } else {
+        for {
+            val (c, ok) = self.peek()
+            if !ok || c < '0' as u8 || c > '9' as u8 {
+                break
+            }
+            self.at = self.at + 1
+        }
+    }
+    val (dot, dok) = self.peek()
+    if dok && dot == '.' as u8 {
+        integer = false
+        self.at = self.at + 1
+        var saw = false
+        for {
+            val (c, ok) = self.peek()
+            if !ok || c < '0' as u8 || c > '9' as u8 {
+                break
+            }
+            saw = true
+            self.at = self.at + 1
+        }
+        if !saw {
+            return Json(), false
+        }
+    }
+    val (exp, eok) = self.peek()
+    if eok && (exp == 'e' as u8 || exp == 'E' as u8) {
+        integer = false
+        self.at = self.at + 1
+        val (sign, sok) = self.peek()
+        if sok && (sign == '+' as u8 || sign == '-' as u8) {
+            self.at = self.at + 1
+        }
+        var saw = false
+        for {
+            val (c, ok) = self.peek()
+            if !ok || c < '0' as u8 || c > '9' as u8 {
+                break
+            }
+            saw = true
+            self.at = self.at + 1
+        }
+        if !saw {
+            return Json(), false
+        }
+    }
+    val literal = view_range(self.source(), start, self.at)
+    var out = Json()
+    out.kind = kind_num
+    out.text = copy_str(literal)
+    if integer {
+        val (n, ok) = strbuilder.parse_i64(out.text, 10)
+        out.int_ok = ok
+        out.int_val = n
+    }
+    return out, true
+}
+
+fn *Parser.source(): str {
+    var view = bytes()
+    if self.buf.len == 0 {
+        return ""
+    }
+    view.ptr = self.buf.ptr
+    view.len = self.buf.len
+    return view
+}
+
+fn *Parser.parse_array(): (Json, bool) with (a: mem.Allocator) {
+    self.at = self.at + 1
+    var arr = j_arr()
+    self.skip()
+    val (c, ok) = self.peek()
+    if ok && c == ']' as u8 {
+        self.at = self.at + 1
+        return arr, true
+    }
+    for {
+        val (elem, eok) = self.parse_value()
+        if !eok {
+            arr.release()
+            return Json(), false
+        }
+        arr.items.push(elem)
+        self.skip()
+        val (n, nok) = self.peek()
+        if nok && n == ',' as u8 {
+            self.at = self.at + 1
+            self.skip()
+            val (look, lok) = self.peek()
+            if !lok || look == ']' as u8 {
+                arr.release()
+                return Json(), false
+            }
+            continue
+        }
+        if nok && n == ']' as u8 {
+            self.at = self.at + 1
+            return arr, true
+        }
+        arr.release()
+        return Json(), false
+    }
+}
+
+fn *Parser.parse_object(): (Json, bool) with (a: mem.Allocator) {
+    self.at = self.at + 1
+    var obj = j_obj()
+    self.skip()
+    val (c, ok) = self.peek()
+    if ok && c == '}' as u8 {
+        self.at = self.at + 1
+        return obj, true
+    }
+    for {
+        val (key, kok) = self.parse_string()
+        if !kok {
+            obj.release()
+            return Json(), false
+        }
+        self.skip()
+        if !self.eat(':' as u8) {
+            free_str(key)
+            obj.release()
+            return Json(), false
+        }
+        self.skip()
+        val (value, vok) = self.parse_value()
+        if !vok {
+            free_str(key)
+            obj.release()
+            return Json(), false
+        }
+        obj.keys.push(key)
+        obj.items.push(value)
+        self.skip()
+        val (n, nok) = self.peek()
+        if nok && n == ',' as u8 {
+            self.at = self.at + 1
+            self.skip()
+            val (look, lok) = self.peek()
+            if !lok || look == '}' as u8 {
+                obj.release()
+                return Json(), false
+            }
+            continue
+        }
+        if nok && n == '}' as u8 {
+            self.at = self.at + 1
+            return obj, true
+        }
+        obj.release()
+        return Json(), false
+    }
+}
+
+fn *Parser.parse_any(): (Json, bool) with (a: mem.Allocator) {
+    self.skip()
+    val (c, ok) = self.peek()
+    if !ok {
+        return Json(), false
+    }
+    if c == '{' as u8 {
+        return self.parse_object()
+    }
+    if c == '[' as u8 {
+        return self.parse_array()
+    }
+    if c == '"' as u8 {
+        val (text, sok) = self.parse_string()
+        if !sok {
+            return Json(), false
+        }
+        return j_str_owned(text), true
+    }
+    if c == 't' as u8 {
+        if !self.parse_literal("true") {
+            return Json(), false
+        }
+        return j_bool(true), true
+    }
+    if c == 'f' as u8 {
+        if !self.parse_literal("false") {
+            return Json(), false
+        }
+        return j_bool(false), true
+    }
+    if c == 'n' as u8 {
+        if !self.parse_literal("null") {
+            return Json(), false
+        }
+        return j_null(), true
+    }
+    if c == '-' as u8 || (c >= '0' as u8 && c <= '9' as u8) {
+        return self.scan_number()
+    }
+    return Json(), false
+}
+
+fn *Parser.parse_value(): (Json, bool) with (a: mem.Allocator) {
+    if self.depth >= json_max_depth {
+        return Json(), false
+    }
+    self.depth = self.depth + 1
+    val (value, ok) = self.parse_any()
+    self.depth = self.depth - 1
+    if !ok {
+        return Json(), false
+    }
+    return value, true
+}
+
+fn parse_document(text: str): (Json, bool) with (a: mem.Allocator) {
+    var p = Parser()
+    p.buf = str_bytes(text)
+    p.skip()
+    if p.at >= p.buf.len {
+        return Json(), false
+    }
+    var (value, ok) = p.parse_value()
+    if !ok {
+        return Json(), false
+    }
+    p.skip()
+    if p.at != p.buf.len {
+        value.release()
+        return Json(), false
+    }
+    return value, true
+}

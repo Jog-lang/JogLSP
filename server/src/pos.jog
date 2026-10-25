@@ -1,0 +1,110 @@
+// Compiler columns are 1-based bytes. LSP characters are 0-based UTF-16
+// code units. A 4-byte scalar is two units. An ill-formed byte counts as
+// one unit so the walk cannot stick.
+
+fn utf8_span(line: []u8, i: usize): (usize, usize) {
+    if i >= line.len {
+        return 0, 0
+    }
+    val b = line[i]
+    var need: usize = 1
+    var units: usize = 1
+    if b < 0x80 {
+        return 1, 1
+    }
+    if (b & 0xE0) == 0xC0 {
+        need = 2
+    } else if (b & 0xF0) == 0xE0 {
+        need = 3
+    } else if (b & 0xF8) == 0xF0 {
+        need = 4
+        units = 2
+    } else {
+        return 1, 1
+    }
+    if i + need > line.len {
+        return 1, 1
+    }
+    var k: usize = 1
+    for k < need {
+        val cont = line[i + k]
+        if (cont & 0xC0) != 0x80 {
+            return 1, 1
+        }
+        k = k + 1
+    }
+    return need, units
+}
+
+fn utf16_column(line: []u8, byte_col: usize): usize {
+    var i: usize = 0
+    var col: usize = 0
+    for i < byte_col && i < line.len {
+        val (adv, units) = utf8_span(line, i)
+        if adv == 0 || i + adv > byte_col {
+            break
+        }
+        i = i + adv
+        col = col + units
+    }
+    return col
+}
+
+// line is the compiler's 1-based line. column is the 1-based byte column.
+// The third number is the end character, one scalar past the start when
+// that scalar fits on the line.
+fn lsp_range(text: str, line: i64, column: i64): (i64, i64, i64) {
+    var lsp_line: i64 = 0
+    if line > 0 {
+        lsp_line = line - 1
+    }
+    if column <= 0 {
+        return lsp_line, 0, 0
+    }
+    val (view, ok) = line_view_at(text, line)
+    if !ok {
+        return lsp_line, 0, 0
+    }
+    val raw = str_bytes(view)
+    val index = (column - 1) as usize
+    val start = utf16_column(raw, index)
+    val (adv, units) = utf8_span(raw, index)
+    var end = start
+    if adv > 0 && units > 0 && index < raw.len {
+        end = start + units
+    }
+    return lsp_line, start as i64, end as i64
+}
+
+fn line_view_at(text: str, line: i64): (str, bool) {
+    if line <= 0 {
+        return "", false
+    }
+    var current: i64 = 1
+    var start: usize = 0
+    var i: usize = 0
+    for i < text.len {
+        if text.ptr[i] == '\n' as u8 {
+            if current == line {
+                return trim_cr(view_range(text, start, i)), true
+            }
+            current = current + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if current == line {
+        return trim_cr(view_range(text, start, text.len)), true
+    }
+    return "", false
+}
+
+fn trim_cr(text: str): str {
+    if text.len == 0 {
+        return ""
+    }
+    if text.ptr[text.len - 1] != '\r' as u8 {
+        return text
+    }
+    return view_range(text, 0, text.len - 1)
+}
