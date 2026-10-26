@@ -21,16 +21,18 @@ function serverExecutable(context) {
     configured,
     path.join(context.extensionPath, "bin", "server.exe"),
     path.resolve(context.extensionPath, "..", "..", "server", "out", "server.exe"),
-    "D:\\Projects\\Jog\\JogLSP\\server\\out\\server.exe",
   ]);
 }
 
 function compilerExecutable() {
-  const configured = vscode.workspace.getConfiguration("jog").get("compilerPath");
+  const inspected = vscode.workspace.getConfiguration("jog").inspect("compilerPath");
+  const explicit = inspected
+    ? (inspected.workspaceFolderValue || inspected.workspaceValue || inspected.globalValue || "")
+    : "";
   return firstExisting([
-    configured,
+    explicit,
     process.env.JOG,
-    "D:\\Projects\\CTools\\build\\jog.exe",
+    "D:\\Projects\\Jog\\JogCompiler\\build\\jog.exe",
   ]);
 }
 

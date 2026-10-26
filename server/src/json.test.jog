@@ -1,5 +1,4 @@
 import std.fs
-import std.list as lists
 import std.mem
 import std.os
 import std.strbuilder

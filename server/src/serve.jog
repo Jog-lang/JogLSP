@@ -8,11 +8,6 @@ import std.io
 import std.mem
 import std.os
 
-private extern {
-    fn _setmode(fd: c.int, mode: c.int): c.int
-    fn _fileno(stream: *c.FILE): c.int
-}
-
 struct InBuf {
     ptr: *u8?
     len: usize
@@ -64,23 +59,19 @@ fn *InBuf.shift(drop: usize) {
     self.len = rest
 }
 
-fn read_stdin(dst: *u8, cap: usize): usize {
-    if cap == 0 {
-        return 0
-    }
-    val stream = c.jogrt_stdin()
-    if stream == null {
-        return 0
-    }
-    return c.fread(dst as *void, 1, cap, stream!! as *c.FILE)
-}
-
 fn *InBuf.pull(): bool with (a: mem.Allocator) {
     self.reserve(self.len + 4096)
     if self.ptr == null {
         return false
     }
-    val n = read_stdin(self.ptr!! + self.len, self.cap - self.len)
+    var window = bytes()
+    window.ptr = self.ptr!! + self.len
+    window.len = self.cap - self.len
+    val (n, ok) = io.read_some(window)
+    if !ok {
+        io.eprint("stdin read failed\n")
+        return false
+    }
     if n == 0 {
         return false
     }
@@ -118,17 +109,6 @@ fn write_stdout(text: str): bool {
     return c.jogrt_write(1, text.ptr as *const void?, text.len)
 }
 
-fn set_binary_io() {
-    val inn = c.jogrt_stdin()
-    val out = c.jogrt_stdout()
-    if inn != null {
-        _setmode(_fileno(inn!! as *c.FILE), 0x8000)
-    }
-    if out != null {
-        _setmode(_fileno(out!! as *c.FILE), 0x8000)
-    }
-}
-
 fn resolve_jog(): str with (a: mem.Allocator) {
     if os.argc() >= 2 {
         return copy_str(os.argv(1))
@@ -137,7 +117,7 @@ fn resolve_jog(): str with (a: mem.Allocator) {
     if ok && env.len > 0 {
         return copy_str(env)
     }
-    return copy_str("D:/Projects/CTools/build/jog.exe")
+    return copy_str("D:/Projects/Jog/JogCompiler/build/jog.exe")
 }
 
 fn buf_as_str(buf: []u8): str {
@@ -151,7 +131,7 @@ fn buf_as_str(buf: []u8): str {
 }
 
 fn serve() with (a: mem.Allocator) {
-    set_binary_io()
+    io.binary_stdio()
     var jog = resolve_jog()
     var srv = server_new(jog)
     free_str(jog)

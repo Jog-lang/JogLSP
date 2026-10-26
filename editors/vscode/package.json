@@ -36,8 +36,8 @@
         },
         "jog.compilerPath": {
           "type": "string",
-          "default": "D:\\Projects\\CTools\\build\\jog.exe",
-          "description": "Path to jog.exe. The language server runs jog check --diag=json on save."
+          "default": "D:\\Projects\\Jog\\JogCompiler\\build\\jog.exe",
+          "description": "Path to jog.exe. A value set in user or workspace settings wins. Otherwise the JOG environment variable, then this default. The language server runs jog check --diag=json on the saved file and passes no --module flags."
         }
       }
     }
