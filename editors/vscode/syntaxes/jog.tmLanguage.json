@@ -54,7 +54,7 @@
       }
     },
     "keyword": {
-      "match": "\\b(fn|var|val|type|struct|interface|enum|if|else|when|for|in|break|continue|return|defer|errdefer|go|with|context|private|import|as|is|null|true|false|bytes|op|escaping|const|extern)\\b",
+      "match": "\\b(fn|var|val|type|struct|interface|enum|if|else|when|for|in|break|continue|return|defer|errdefer|go|with|context|private|import|as|is|null|true|false|bytes|op|escaping|const|extern|expect|actual)\\b",
       "name": "keyword.control.jog"
     },
     "number": {
