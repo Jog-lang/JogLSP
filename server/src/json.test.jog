@@ -38,19 +38,20 @@ fn corpus_dir(name: str): str with (a: mem.Allocator) {
 }
 
 fn round_trip_file(path: str): bool with (t: testing.Testing, a: mem.Allocator) {
-    var (data, ok) = fs.read_all(path)
-    if !ok {
+    var (data, err) = fs.read_all(path)
+    if err != null {
         t.fail(path)
         return false
     }
+    defer a.free(data)
     val text: str = data
     var (first, fok) = parse_document(text)
     if !fok {
-        a.free(data)
         t.fail(path)
         return false
     }
     var built = strbuilder.empty()
+    defer built.free()
     write_json(&first, &built)
     var (second, sok) = parse_document(built.str())
     val same = sok && json_eq(&first, &second)
@@ -58,8 +59,6 @@ fn round_trip_file(path: str): bool with (t: testing.Testing, a: mem.Allocator) 
         second.release()
     }
     first.release()
-    built.free()
-    a.free(data)
     if !same {
         t.fail(path)
     }
@@ -67,20 +66,19 @@ fn round_trip_file(path: str): bool with (t: testing.Testing, a: mem.Allocator) 
 }
 
 fn rejects_file(path: str): bool with (t: testing.Testing, a: mem.Allocator) {
-    var (data, ok) = fs.read_all(path)
-    if !ok {
+    var (data, err) = fs.read_all(path)
+    if err != null {
         t.fail(path)
         return false
     }
+    defer a.free(data)
     val text: str = data
     var (value, pok) = parse_document(text)
     if pok {
         value.release()
-        a.free(data)
         t.fail(path)
         return false
     }
-    a.free(data)
     return true
 }
 
@@ -90,19 +88,16 @@ fn each_json(dir: str, valid: bool) with (t: testing.Testing, a: mem.Allocator) 
         t.fail(dir)
         return
     }
-    var i: usize = 0
-    for i < names.len {
-        val name = names.get(i)
+    for name in names.items() {
         if has_suffix(name, ".json") {
             val path = fs.join(dir, name)
+            defer free_str(path)
             if valid {
                 round_trip_file(path)
             } else {
                 rejects_file(path)
             }
-            free_str(path)
         }
-        i = i + 1
     }
     fs.free_names(&names)
 }

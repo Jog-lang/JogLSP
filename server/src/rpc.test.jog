@@ -214,8 +214,8 @@ fn save_publishes_and_clears() with (t: testing.Testing) {
         val mod = fs.join(dir, "jog.mod")
         val file = fs.join(dir, "bad.jog")
         val src = "fn main() {\n    val n: i32 = \"é\" + 1\n}\n"
-        t.expect(fs.write_all(mod, text_bytes("module fixture\n")))
-        t.expect(fs.write_all(file, text_bytes(src)))
+        t.expect(fs.write_all(mod, text_bytes("module fixture\n")) == null)
+        t.expect(fs.write_all(file, text_bytes(src)) == null)
         val uri = path_to_uri(file)
         var srv = server_new(jog_bin())
         val init = rpc_body("initialize", 1, true, j_obj())
@@ -268,7 +268,7 @@ fn save_publishes_and_clears() with (t: testing.Testing) {
         free_str(saved)
 
         val clean = "fn main() {\n}\n"
-        t.expect(fs.write_all(file, text_bytes(clean)))
+        t.expect(fs.write_all(file, text_bytes(clean)) == null)
         var changed = j_obj()
         changed.put_str("text", clean)
         var changes = j_arr()
@@ -323,9 +323,9 @@ fn save_publishes_unimported_package() with (t: testing.Testing) {
         val root = fs.join(dir, "main.jog")
         val file = fs.join(sub, "x.jog")
         val src = "fn broken(): i32 {\n    val s: str = \"text\"\n    return s\n}\n"
-        t.expect(fs.write_all(mod, text_bytes("module fixture\n")))
-        t.expect(fs.write_all(root, text_bytes("fn main() {\n}\n")))
-        t.expect(fs.write_all(file, text_bytes(src)))
+        t.expect(fs.write_all(mod, text_bytes("module fixture\n")) == null)
+        t.expect(fs.write_all(root, text_bytes("fn main() {\n}\n")) == null)
+        t.expect(fs.write_all(file, text_bytes(src)) == null)
         val uri = path_to_uri(file)
         var srv = server_new(jog_bin())
         val init = rpc_body("initialize", 1, true, j_obj())

@@ -8,6 +8,7 @@
 import std.list as lists
 import std.mem
 import std.strbuilder
+import std.text
 
 val kind_null: u8 = 0
 val kind_bool: u8 = 1
@@ -279,7 +280,7 @@ fn write_json(v: *Json, out: *strbuilder.StrBuilder) with (a: mem.Allocator) {
 }
 
 fn hex_digit(c: u8): (u32, bool) {
-    if c >= '0' as u8 && c <= '9' as u8 {
+    if text.is_digit(c) {
         return (c as u32) - ('0' as u32), true
     }
     if c >= 'a' as u8 && c <= 'f' as u8 {

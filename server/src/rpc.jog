@@ -262,28 +262,26 @@ fn run_check(jog: str, path: str): (lists.List<Diag>, bool) with (a: mem.Allocat
     args.push("check")
     args.push(path)
     args.push("--diag=json")
-    val output = proc.run(args.slice_view())
-    args.free()
-    if !output.ok {
-        proc.free_output(output)
+    var (output, err) = proc.run(args.items())
+    defer args.free()
+    defer proc.free_output(output)
+    if err != null {
         var empty: lists.List<Diag>
         return empty, false
     }
     val text: str = output.stdout
     var (diags, ok) = parse_diag_lines(text)
     if !ok {
-        proc.free_output(output)
         var empty: lists.List<Diag>
         return empty, false
     }
     if output.code != 0 && diags.len == 0 {
         io.eprint("jog check failed\n")
-        val err: str = output.stderr
-        if err.len > 0 {
-            io.eprint(err)
+        val err_text: str = output.stderr
+        if err_text.len > 0 {
+            io.eprint(err_text)
         }
     }
-    proc.free_output(output)
     return diags, true
 }
 

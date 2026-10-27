@@ -6,6 +6,7 @@
 import std.list as lists
 import std.mem
 import std.strbuilder
+import std.text
 
 struct Diag {
     path: str
@@ -96,19 +97,14 @@ fn parse_diag_lines(text: str): (lists.List<Diag>, bool) with (a: mem.Allocator)
 }
 
 fn severity_code(name: str): i64 {
-    if name == "error" {
-        return 1
+    return when name {
+        "error" -> 1
+        "warning" -> 2
+        "information" -> 3
+        "note" -> 3
+        "hint" -> 4
+        else -> 1
     }
-    if name == "warning" {
-        return 2
-    }
-    if name == "information" || name == "note" {
-        return 3
-    }
-    if name == "hint" {
-        return 4
-    }
-    return 1
 }
 
 fn is_uri_plain(c: u8): bool {
@@ -118,7 +114,7 @@ fn is_uri_plain(c: u8): bool {
     if c >= 'a' as u8 && c <= 'z' as u8 {
         return true
     }
-    if c >= '0' as u8 && c <= '9' as u8 {
+    if text.is_digit(c) {
         return true
     }
     if c == '-' as u8 || c == '.' as u8 || c == '_' as u8 || c == '~' as u8 {
@@ -132,6 +128,7 @@ fn is_uri_plain(c: u8): bool {
 
 fn norm_path(path: str): str with (a: mem.Allocator) {
     var built = strbuilder.empty()
+    defer built.free()
     var i: usize = 0
     for i < path.len {
         val c = path.ptr[i]
@@ -144,13 +141,12 @@ fn norm_path(path: str): str with (a: mem.Allocator) {
         }
         i = i + 1
     }
-    val out = copy_str(built.str())
-    built.free()
-    return out
+    return copy_str(built.str())
 }
 
 fn path_to_uri(path: str): str with (a: mem.Allocator) {
     var built = strbuilder.empty()
+    defer built.free()
     built.append("file://")
     if path.len >= 2 && path.ptr[1] == ':' as u8 {
         built.append("/")
@@ -171,17 +167,15 @@ fn path_to_uri(path: str): str with (a: mem.Allocator) {
         }
         i = i + 1
     }
-    val out = copy_str(built.str())
-    built.free()
-    return out
+    return copy_str(built.str())
 }
 
-fn take_hex(text: str, i: usize): (u8, bool) {
-    if i + 1 >= text.len {
+fn take_hex(src: str, i: usize): (u8, bool) {
+    if i + 1 >= src.len {
         return 0, false
     }
-    val (hi, hok) = hex_digit(text.ptr[i])
-    val (lo, lok) = hex_digit(text.ptr[i + 1])
+    val (hi, hok) = hex_digit(src.ptr[i])
+    val (lo, lok) = hex_digit(src.ptr[i + 1])
     if !hok || !lok {
         return 0, false
     }
