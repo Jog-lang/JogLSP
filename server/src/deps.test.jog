@@ -118,11 +118,12 @@ fn missing_require_is_diagnostic() with (t: testing.Testing) {
 }
 
 @test
-fn run_check_uses_module_flags() with (t: testing.Testing) {
+fn run_analyze_uses_module_flags() with (t: testing.Testing) {
     with (mem.heap()) {
         val app = deps_fixture("ok/app")
         val file = fs.join(app, "main.jog")
-        var (diags, ok) = run_check(jog_bin(), file)
+        var srv = server_new(jog_bin())
+        var (diags, ok) = srv.run_analyze(file)
         t.expect(ok)
         t.expect(diags.len == 0)
         free_diags(&diags)
@@ -131,11 +132,12 @@ fn run_check_uses_module_flags() with (t: testing.Testing) {
 
         val miss = deps_fixture("missing/app")
         val bad = fs.join(miss, "main.jog")
-        var (bad_diags, bok) = run_check(jog_bin(), bad)
+        var (bad_diags, bok) = srv.run_analyze(bad)
         t.expect(bok)
         t.expect(bad_diags.len > 0)
         free_diags(&bad_diags)
         fs.free_str(bad)
         free_str(miss)
+        srv.release()
     }
 }

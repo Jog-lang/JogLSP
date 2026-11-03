@@ -1,0 +1,98 @@
+// In-process diagnostics via jogc.src.frontend.analyze. Replaces spawning
+// `jog check --diag=json`. Still asks jog-build for --module flags when
+// jog.mod has require lines.
+
+import jogc.src.frontend
+import std.fs
+import std.list as lists
+import std.mem
+
+fn strip_module_prefix(flag: str): str with (a: mem.Allocator) {
+    if starts_with(flag, "--module=") {
+        return copy_str(view_range(flag, 9, flag.len))
+    }
+    if starts_with(flag, "--module") && flag.len > 8 && flag.ptr[8] == '=' as u8 {
+        return copy_str(view_range(flag, 9, flag.len))
+    }
+    return copy_str(flag)
+}
+
+fn module_flag_values(raw: lists.List<str>): lists.List<str> with (a: mem.Allocator) {
+    var out: lists.List<str>
+    var i: usize = 0
+    for i < raw.len {
+        out.push(strip_module_prefix(raw.get(i)))
+        i = i + 1
+    }
+    return out
+}
+
+fn *Server.override_lists(): (lists.List<str>, lists.List<str>) with (a: mem.Allocator) {
+    var paths: lists.List<str>
+    var texts: lists.List<str>
+    var i: usize = 0
+    for i < self.docs.len {
+        var doc = self.docs.get(i)
+        if doc.path.len > 0 {
+            paths.push(copy_str(doc.path))
+            texts.push(copy_str(doc.text))
+        }
+        i = i + 1
+    }
+    return paths, texts
+}
+
+fn diags_from_frontend(xs: lists.List<frontend.Diag>): lists.List<Diag> with (a: mem.Allocator) {
+    var out: lists.List<Diag>
+    var i: usize = 0
+    for i < xs.len {
+        val f = xs.get(i)
+        var d: Diag
+        d.path = copy_str(f.path)
+        d.line = f.line
+        d.column = f.column
+        d.severity = copy_str(f.severity)
+        d.message = copy_str(f.message)
+        out.push(d)
+        i = i + 1
+    }
+    return out
+}
+
+fn *Server.run_analyze(path: str): (lists.List<Diag>, bool) with (a: mem.Allocator) {
+    var flags: lists.List<str>
+    var deps_err = ""
+    var deps_path = ""
+    val root = module_root_of(path)
+    if root.len > 0 && mod_has_require(root) {
+        val tool = resolve_jog_build(self.jog)
+        var (raw, err, ok) = fetch_module_flags(root, tool)
+        if ok {
+            flags = module_flag_values(raw)
+            free_strs(&raw)
+        } else {
+            deps_err = err
+            deps_path = fs.join(root, "jog.mod")
+        }
+        free_str(tool)
+    }
+    free_str(root)
+    var (paths, texts) = self.override_lists()
+    var result = frontend.analyze(path, flags.items(), paths.items(), texts.items())
+    free_strs(&flags)
+    free_strs(&paths)
+    free_strs(&texts)
+    var diags = diags_from_frontend(result.diags)
+    frontend.free_diags(&result.diags)
+    if deps_err.len > 0 && diags.len == 0 {
+        val target = deps_path
+        if target.len == 0 {
+            diags.push(synthetic_deps_diag(path, deps_err))
+        } else {
+            diags.push(synthetic_deps_diag(target, deps_err))
+        }
+    }
+    free_str(deps_err)
+    free_str(deps_path)
+    return diags, true
+}

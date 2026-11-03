@@ -1,0 +1,130 @@
+// P4 fuzz: truncate every file under JogCompiler tests/jog at random
+// offsets and send each as didChange. The server must not crash.
+
+import std.fs
+import std.list as lists
+import std.mem
+import std.os
+import std.testing
+
+fn compiler_tests_jog(): str with (a: mem.Allocator) {
+    var (env, ok) = os.env("JOG_COMPILER")
+    if ok && env.len > 0 {
+        return fs.join(env, "tests/jog")
+    }
+    return copy_str("/home/plague_doc/Documents/Projects/Jog/JogCompiler/tests/jog")
+}
+
+fn collect_jog_files(dir: str, out: *lists.List<str>) with (a: mem.Allocator) {
+    var (names, listed) = fs.list(dir)
+    if !listed {
+        return
+    }
+    for name in names.items() {
+        val full = fs.join(dir, name)
+        if has_suffix_jog(name) {
+            out.push(full)
+        } else {
+            // Recurse into subdirs when list succeeds as a directory.
+            var (kids, ok) = fs.list(full)
+            if ok {
+                fs.free_names(&kids)
+                collect_jog_files(full, out)
+            }
+            fs.free_str(full)
+        }
+    }
+    fs.free_names(&names)
+}
+
+fn has_suffix_jog(name: str): bool {
+    if name.len < 4 {
+        return false
+    }
+    return view_range(name, name.len - 4, name.len) == ".jog"
+}
+
+fn mix(seed: usize, i: usize): usize {
+    // Overflow-safe mix for cut points (Jog panics on wrap).
+    return (seed + i * 7919) + (i * i)
+}
+
+@test
+fn fuzz_truncated_did_change() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val root = compiler_tests_jog()
+        var files: lists.List<str>
+        collect_jog_files(root, &files)
+        t.expect(files.len > 0)
+        var srv = server_new(jog_bin())
+        val init = rpc_body("initialize", 1, true, j_obj())
+        val init_out = srv.handle(init)
+        free_str(init_out)
+        free_str(init)
+        var i: usize = 0
+        for i < files.len {
+            val path = files.get(i)
+            var (data, err) = fs.read_all(path)
+            if err != null {
+                i = i + 1
+                continue
+            }
+            val full: str = data
+            var cut = full.len
+            if cut > 0 {
+                cut = mix(0xC0FFEE, i) % (cut + 1)
+            }
+            val truncated = view_range(full, 0, cut)
+            val uri = path_to_uri(path)
+            var doc = j_obj()
+            doc.put_str("uri", uri)
+            doc.put_str("languageId", "jog")
+            doc.put_int("version", 1)
+            doc.put_str("text", truncated)
+            var open_params = j_obj()
+            open_params.put("textDocument", doc)
+            val opened = rpc_body("textDocument/didOpen", 0, false, open_params)
+            val open_out = srv.handle(opened)
+            free_str(open_out)
+            free_str(opened)
+            var changed = j_obj()
+            changed.put_str("text", truncated)
+            var changes = j_arr()
+            changes.items.push(changed)
+            var change_doc = j_obj()
+            change_doc.put_str("uri", uri)
+            change_doc.put_int("version", 2)
+            var change_params = j_obj()
+            change_params.put("textDocument", change_doc)
+            change_params.put("contentChanges", changes)
+            val edited = rpc_body("textDocument/didChange", 0, false, change_params)
+            val edit_out = srv.handle(edited)
+            // Surviving the handle is the fuzz gate.
+            t.expect(edit_out.len >= 0)
+            free_str(edit_out)
+            free_str(edited)
+            var close_doc = j_obj()
+            close_doc.put_str("uri", uri)
+            var close_params = j_obj()
+            close_params.put("textDocument", close_doc)
+            val closed = rpc_body("textDocument/didClose", 0, false, close_params)
+            val close_out = srv.handle(closed)
+            free_str(close_out)
+            free_str(closed)
+            free_str(uri)
+            
+            i = i + 1
+        }
+        val down = rpc_body("shutdown", 2, true, j_obj())
+        val down_out = srv.handle(down)
+        free_str(down_out)
+        free_str(down)
+        val done = rpc_body("exit", 0, false, j_obj())
+        val done_out = srv.handle(done)
+        free_str(done_out)
+        free_str(done)
+        srv.release()
+        free_strs(&files)
+        free_str(root)
+    }
+}

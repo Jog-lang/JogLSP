@@ -1,15 +1,14 @@
-// Diagnostics-only session. initialize advertises full text sync and
-// save notifications. didSave runs jog check and publishes one list per
-// file. A file that was dirty and is now clean gets an empty list, which
-// is what clears the squiggles. Requests before initialize get -32002.
-// Requests after shutdown get -32600. exit sets the process status:
+// Language server session. initialize advertises full text sync, save
+// notifications, and P4 providers (symbols, hover, definition, completion).
+// didOpen / didChange / didSave run the jogc frontend in-process and publish
+// one diagnostic list per file. A file that was dirty and is now clean gets
+// an empty list, which clears the squiggles. Requests before initialize get
+// -32002. Requests after shutdown get -32600. exit sets the process status:
 // 0 after shutdown, 1 otherwise. Bad JSON is ignored and the loop stays up.
 
-import std.fs
 import std.io
 import std.list as lists
 import std.mem
-import std.proc
 import std.strbuilder
 
 val state_new: u8 = 0
@@ -142,6 +141,10 @@ fn capabilities(): Json with (a: mem.Allocator) {
     sync.put_bool("save", true)
     var caps = j_obj()
     caps.put("textDocumentSync", sync)
+    caps.put_bool("documentSymbolProvider", true)
+    caps.put_bool("hoverProvider", true)
+    caps.put_bool("definitionProvider", true)
+    caps.put_bool("completionProvider", true)
     var result = j_obj()
     result.put("capabilities", caps)
     return result
@@ -257,72 +260,6 @@ fn *Server.text_of(uri: str): (str, i64, bool) {
     return doc.text, doc.version, true
 }
 
-fn run_check(jog: str, path: str): (lists.List<Diag>, bool) with (a: mem.Allocator) {
-    var args: lists.List<str>
-    var owned: lists.List<str>
-    args.push(jog)
-    args.push("check")
-    args.push(path)
-    var deps_err = ""
-    var deps_path = ""
-    val root = module_root_of(path)
-    if root.len > 0 && mod_has_require(root) {
-        val tool = resolve_jog_build(jog)
-        var (flags, err, ok) = fetch_module_flags(root, tool)
-        if ok {
-            var i: usize = 0
-            for i < flags.len {
-                val flag = flags.get(i)
-                args.push(flag)
-                owned.push(flag)
-                i = i + 1
-            }
-            flags.free()
-        } else {
-            deps_err = err
-            deps_path = fs.join(root, "jog.mod")
-        }
-        free_str(tool)
-    }
-    free_str(root)
-    args.push("--diag=json")
-    var (output, err) = proc.run(args.items())
-    defer args.free()
-    defer free_strs(&owned)
-    defer proc.free_output(output)
-    if err != null {
-        free_str(deps_err)
-        free_str(deps_path)
-        var empty: lists.List<Diag>
-        return empty, false
-    }
-    val text: str = output.stdout
-    var (diags, ok) = parse_diag_lines(text)
-    if !ok {
-        free_str(deps_err)
-        free_str(deps_path)
-        var empty: lists.List<Diag>
-        return empty, false
-    }
-    if output.code != 0 && diags.len == 0 {
-        io.eprint("jog check failed\n")
-        val err_text: str = output.stderr
-        if err_text.len > 0 {
-            io.eprint(err_text)
-        }
-    }
-    if deps_err.len > 0 && diags.len == 0 {
-        val target = deps_path
-        if target.len == 0 {
-            diags.push(synthetic_deps_diag(path, deps_err))
-        } else {
-            diags.push(synthetic_deps_diag(target, deps_err))
-        }
-    }
-    free_str(deps_err)
-    free_str(deps_path)
-    return diags, true
-}
 
 fn *Server.uri_for(key: str, fallback: str): str with (a: mem.Allocator) {
     var i: usize = 0
@@ -367,13 +304,13 @@ fn *Server.publish_empty(uri: str, out: *strbuilder.StrBuilder) with (a: mem.All
     self.publish(uri, j_arr(), out)
 }
 
-fn *Server.on_save(uri: str, out: *strbuilder.StrBuilder) with (a: mem.Allocator) {
+fn *Server.publish_check(uri: str, out: *strbuilder.StrBuilder) with (a: mem.Allocator) {
     var (path, pok) = uri_to_path(uri)
     if !pok {
         io.eprint("bad uri\n")
         return
     }
-    var (diags, ok) = run_check(self.jog, path)
+    var (diags, ok) = self.run_analyze(path)
     var buckets: lists.List<Bucket>
     val saved_norm = norm_path(path)
     val saved_uri = copy_str(uri)
@@ -407,7 +344,7 @@ fn *Server.on_save(uri: str, out: *strbuilder.StrBuilder) with (a: mem.Allocator
             var items = diags_for(body, &diags, bucket.key)
             self.publish(bucket.uri, items, out)
         } else if bucket.uri == saved_uri {
-            var items = point_diag("cannot run jog check")
+            var items = point_diag("cannot run in-process check")
             self.publish(bucket.uri, items, out)
         }
         emitted.push(copy_str(bucket.uri))
@@ -436,7 +373,7 @@ fn *Server.on_save(uri: str, out: *strbuilder.StrBuilder) with (a: mem.Allocator
     }
 }
 
-fn *Server.on_open(params: *Json) with (a: mem.Allocator) {
+fn *Server.on_open(params: *Json, out: *strbuilder.StrBuilder) with (a: mem.Allocator) {
     var (doc, ok) = params.field("textDocument")
     if !ok {
         return
@@ -452,9 +389,10 @@ fn *Server.on_open(params: *Json) with (a: mem.Allocator) {
         version = ver
     }
     self.upsert(uri, version, text)
+    self.publish_check(uri, out)
 }
 
-fn *Server.on_change(params: *Json) with (a: mem.Allocator) {
+fn *Server.on_change(params: *Json, out: *strbuilder.StrBuilder) with (a: mem.Allocator) {
     var (doc, ok) = params.field("textDocument")
     if !ok {
         return
@@ -486,6 +424,7 @@ fn *Server.on_change(params: *Json) with (a: mem.Allocator) {
     }
     if saw {
         self.upsert(uri, version, text)
+        self.publish_check(uri, out)
     }
 }
 
@@ -584,11 +523,11 @@ fn *Server.on_rpc(root: *Json, out: *strbuilder.StrBuilder) with (a: mem.Allocat
     }
     var (params, _) = root.field("params")
     if method == "textDocument/didOpen" {
-        self.on_open(&params)
+        self.on_open(&params, out)
         return
     }
     if method == "textDocument/didChange" {
-        self.on_change(&params)
+        self.on_change(&params, out)
         return
     }
     if method == "textDocument/didClose" {
@@ -614,8 +553,32 @@ fn *Server.on_rpc(root: *Json, out: *strbuilder.StrBuilder) with (a: mem.Allocat
                 self.upsert(uri, version, text)
             }
             if uok {
-                self.on_save(uri, out)
+                self.publish_check(uri, out)
             }
+        }
+        return
+    }
+    if method == "textDocument/documentSymbol" {
+        if has_id {
+            self.on_document_symbol(&id, &params, out)
+        }
+        return
+    }
+    if method == "textDocument/hover" {
+        if has_id {
+            self.on_hover(&id, &params, out)
+        }
+        return
+    }
+    if method == "textDocument/definition" {
+        if has_id {
+            self.on_definition(&id, &params, out)
+        }
+        return
+    }
+    if method == "textDocument/completion" {
+        if has_id {
+            self.on_completion(&id, &params, out)
         }
         return
     }
