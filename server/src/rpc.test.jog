@@ -1,4 +1,3 @@
-import std.c
 import std.fs
 import std.mem
 import std.os
@@ -53,20 +52,12 @@ fn error_code(root: *Json): (i64, bool) {
 }
 
 fn make_dir(path: str): bool {
-    var wide: [4096]u16
-    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
-        return false
-    }
-    return c.CreateDirectoryW(wide[..].ptr, 0) != 0
+    return host_mkdir(path)
 }
 
 fn delete_path(path: str) {
-    var wide: [4096]u16
-    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
-        return
-    }
-    c.DeleteFileW(wide[..].ptr)
-    c.RemoveDirectoryW(wide[..].ptr)
+    host_remove_file(path)
+    host_remove_dir(path)
 }
 
 fn text_bytes(text: str): bytes {
@@ -77,21 +68,10 @@ fn text_bytes(text: str): bytes {
 }
 
 fn scratch_dir(): str with (a: mem.Allocator) {
-    var buf: [512]u8
-    var wide: [512]u16
-    val n = c.GetTempPathW(512, wide[..].ptr)
-    val chars = n as usize
-    if chars == 0 || chars >= 512 {
+    val temp = host_temp_dir()
+    if temp.len == 0 {
         return ""
     }
-    val len = c.wide_to_utf8(wide[..].ptr, chars, buf[..].ptr, 512)
-    if len == 0 || len >= 512 {
-        return ""
-    }
-    var raw = bytes()
-    raw.ptr = buf[..].ptr
-    raw.len = len
-    val temp = copy_str(raw as str)
     val dir = fs.join(temp, "jog-lsp-p2")
     free_str(temp)
     return dir

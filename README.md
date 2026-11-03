@@ -28,7 +28,7 @@ jog build
 
 `jog build` writes `server/out/server.exe`. `jog test` writes that same path, so build again after a test run when you want the server rather than the test runner. The process reads framed messages from stdin and writes them to stdout. Logs go to stderr. On Windows the server sets stdin and stdout to binary mode so `Content-Length` counts bytes.
 
-On save the server runs `jog check` on the file on disk, with `--diag=json` and no `--module` flags. The compiler path is the first argument, or the `JOG` environment variable when that argument is absent. If neither is set, the server uses `D:\Projects\Jog\JogCompiler\build\jog.exe`.
+On save the server runs `jog check` on the file on disk, with `--diag=json`. When that module’s `jog.mod` has `require` lines, it first runs `jog-build deps --flags` in the module root and appends those `--module=…` arguments. The compiler path is the first argument, or the `JOG` environment variable when that argument is absent. `jog-build` is `JOG_BUILD`, else a binary next to `jog`, else `jog-build` on `PATH`.
 
 ## Editor
 

@@ -5,6 +5,7 @@
 // Requests after shutdown get -32600. exit sets the process status:
 // 0 after shutdown, 1 otherwise. Bad JSON is ignored and the loop stays up.
 
+import std.fs
 import std.io
 import std.list as lists
 import std.mem
@@ -258,20 +259,48 @@ fn *Server.text_of(uri: str): (str, i64, bool) {
 
 fn run_check(jog: str, path: str): (lists.List<Diag>, bool) with (a: mem.Allocator) {
     var args: lists.List<str>
+    var owned: lists.List<str>
     args.push(jog)
     args.push("check")
     args.push(path)
+    var deps_err = ""
+    var deps_path = ""
+    val root = module_root_of(path)
+    if root.len > 0 && mod_has_require(root) {
+        val tool = resolve_jog_build(jog)
+        var (flags, err, ok) = fetch_module_flags(root, tool)
+        if ok {
+            var i: usize = 0
+            for i < flags.len {
+                val flag = flags.get(i)
+                args.push(flag)
+                owned.push(flag)
+                i = i + 1
+            }
+            flags.free()
+        } else {
+            deps_err = err
+            deps_path = fs.join(root, "jog.mod")
+        }
+        free_str(tool)
+    }
+    free_str(root)
     args.push("--diag=json")
     var (output, err) = proc.run(args.items())
     defer args.free()
+    defer free_strs(&owned)
     defer proc.free_output(output)
     if err != null {
+        free_str(deps_err)
+        free_str(deps_path)
         var empty: lists.List<Diag>
         return empty, false
     }
     val text: str = output.stdout
     var (diags, ok) = parse_diag_lines(text)
     if !ok {
+        free_str(deps_err)
+        free_str(deps_path)
         var empty: lists.List<Diag>
         return empty, false
     }
@@ -282,6 +311,16 @@ fn run_check(jog: str, path: str): (lists.List<Diag>, bool) with (a: mem.Allocat
             io.eprint(err_text)
         }
     }
+    if deps_err.len > 0 && diags.len == 0 {
+        val target = deps_path
+        if target.len == 0 {
+            diags.push(synthetic_deps_diag(path, deps_err))
+        } else {
+            diags.push(synthetic_deps_diag(target, deps_err))
+        }
+    }
+    free_str(deps_err)
+    free_str(deps_path)
     return diags, true
 }
 

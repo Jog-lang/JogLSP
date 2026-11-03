@@ -1,0 +1,45 @@
+import std.c
+import std.fs
+import std.mem
+import std.os
+
+private fn fill(path: str, dest: *u8): bool {
+    if path.len == 0 || path.len >= 4096 {
+        return false
+    }
+    c.memcpy(dest as *void, path.ptr as *const void, path.len)
+    dest[path.len] = 0
+    return true
+}
+
+actual fn host_mkdir(path: str): bool {
+    var buf: [4096]u8
+    if !fill(path, buf[..].ptr) {
+        return false
+    }
+    return c.jogrt_mkdir(buf[..].ptr as *const c.char) == 0
+}
+
+actual fn host_remove_file(path: str) {
+    var buf: [4096]u8
+    if !fill(path, buf[..].ptr) {
+        return
+    }
+    c.unlink(buf[..].ptr as *const c.char)
+}
+
+actual fn host_remove_dir(path: str) {
+    var buf: [4096]u8
+    if !fill(path, buf[..].ptr) {
+        return
+    }
+    c.rmdir(buf[..].ptr as *const c.char)
+}
+
+actual fn host_temp_dir(): str with (a: mem.Allocator) {
+    var (tmp, ok) = os.env("TMPDIR")
+    if ok && tmp.len > 0 {
+        return fs.copy_str(tmp)
+    }
+    return fs.copy_str("/tmp")
+}

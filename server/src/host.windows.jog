@@ -1,0 +1,49 @@
+import std.c
+import std.fs
+import std.mem
+
+private fn to_wide(path: str, wide: *[4096]u16): bool {
+    return c.utf8_to_wide(path, wide[..].ptr, 4096)
+}
+
+actual fn host_mkdir(path: str): bool {
+    var wide: [4096]u16
+    if !to_wide(path, &wide) {
+        return false
+    }
+    return c.CreateDirectoryW(wide[..].ptr, 0) != 0
+}
+
+actual fn host_remove_file(path: str) {
+    var wide: [4096]u16
+    if !to_wide(path, &wide) {
+        return
+    }
+    c.DeleteFileW(wide[..].ptr)
+}
+
+actual fn host_remove_dir(path: str) {
+    var wide: [4096]u16
+    if !to_wide(path, &wide) {
+        return
+    }
+    c.RemoveDirectoryW(wide[..].ptr)
+}
+
+actual fn host_temp_dir(): str with (a: mem.Allocator) {
+    var buf: [512]u8
+    var wide: [512]u16
+    val n = c.GetTempPathW(512, wide[..].ptr)
+    val chars = n as usize
+    if chars == 0 || chars >= 512 {
+        return ""
+    }
+    val len = c.wide_to_utf8(wide[..].ptr, chars, buf[..].ptr, 512)
+    if len == 0 || len >= 512 {
+        return ""
+    }
+    var raw = bytes()
+    raw.ptr = buf[..].ptr
+    raw.len = len
+    return fs.copy_str(raw as str)
+}

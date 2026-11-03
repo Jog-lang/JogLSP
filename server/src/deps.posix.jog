@@ -1,0 +1,13 @@
+import std.list as lists
+import std.mem
+
+actual fn deps_flags_argv(root: str, tool: str): lists.List<str> with (a: mem.Allocator) {
+    var args: lists.List<str>
+    args.push(copy_str("sh"))
+    args.push(copy_str("-c"))
+    args.push(copy_str("cd \"$1\" && exec \"$2\" deps --flags"))
+    args.push(copy_str("sh"))
+    args.push(copy_str(root))
+    args.push(copy_str(tool))
+    return args
+}
