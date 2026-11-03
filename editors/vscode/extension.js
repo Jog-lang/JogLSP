@@ -1,27 +1,17 @@
 "use strict";
 
-const fs = require("fs");
 const path = require("path");
 const vscode = require("vscode");
+const {
+  resolveServerExecutable,
+  resolveCompilerExecutable,
+} = require("./paths");
 
 let client = null;
 
-function firstExisting(candidates) {
-  for (const candidate of candidates) {
-    if (candidate && fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  return "";
-}
-
 function serverExecutable(context) {
   const configured = vscode.workspace.getConfiguration("jog").get("serverPath");
-  return firstExisting([
-    configured,
-    path.join(context.extensionPath, "bin", "server.exe"),
-    path.resolve(context.extensionPath, "..", "..", "server", "out", "server.exe"),
-  ]);
+  return resolveServerExecutable(context.extensionPath, configured);
 }
 
 function compilerExecutable() {
@@ -29,11 +19,7 @@ function compilerExecutable() {
   const explicit = inspected
     ? (inspected.workspaceFolderValue || inspected.workspaceValue || inspected.globalValue || "")
     : "";
-  return firstExisting([
-    explicit,
-    process.env.JOG,
-    "D:\\Projects\\Jog\\JogCompiler\\build\\jog.exe",
-  ]);
+  return resolveCompilerExecutable(explicit, process.env.JOG);
 }
 
 function activate(context) {
@@ -51,11 +37,11 @@ function activate(context) {
   context.subscriptions.push(output);
 
   if (!server) {
-    vscode.window.showErrorMessage("Jog: language server not found. Build server/out/server.exe or set jog.serverPath.");
+    vscode.window.showErrorMessage("Jog: language server not found. Build server/out/server (or server.exe) or set jog.serverPath.");
     return;
   }
   if (!jog) {
-    vscode.window.showErrorMessage("Jog: jog.exe not found. Set jog.compilerPath or the JOG environment variable.");
+    vscode.window.showErrorMessage("Jog: jog not found. Set jog.compilerPath or the JOG environment variable.");
     return;
   }
 

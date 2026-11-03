@@ -34,13 +34,26 @@ On save the server runs `jog check` on the file on disk, with `--diag=json` and 
 
 `editors/vscode` is a VS Code and Cursor extension: a TextMate grammar, a language configuration, and a small client that starts the language server. Highlighting comes from the grammar and does not need the server.
 
-From `editors/vscode`, with `server/out/server.exe` already built:
+From `editors/vscode`, with `server/out/server` already built (`.exe` on Windows):
+
+**Linux**
+
+```
+npm install
+cp ../../server/out/server bin/server
+npx @vscode/vsce package --allow-missing-repository
+cursor --install-extension jog-0.0.1.vsix --force
+```
+
+**Windows**
 
 ```
 npm install
 Copy-Item ..\..\server\out\server.exe bin\server.exe
 npx @vscode/vsce package --allow-missing-repository
-cursor --install-extension jog-0.0.1.vsix
+cursor --install-extension jog-0.0.1.vsix --force
 ```
 
-Reload the window after installing. The client starts `bin/server.exe`, or `server/out/server.exe` from this checkout. It passes `jog.compilerPath` when that setting is set in user or workspace settings; otherwise it uses `JOG`, then `D:\Projects\Jog\JogCompiler\build\jog.exe`.
+Reload the window after installing. The client starts `bin/server` / `bin/server.exe`, or `server/out/server` from this checkout. It passes `jog.compilerPath` when that setting is set in user or workspace settings; otherwise it uses `JOG`, then `~/.local/bin/jog`, then the historical Windows seed path.
+
+P2 editor smoke: `JOG=/path/to/jog node editors/vscode/verify-p2.js`.

@@ -7,15 +7,24 @@
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Programming Languages"],
-  "activationEvents": ["onLanguage:jog"],
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:jog"
+  ],
   "main": "./extension.js",
   "contributes": {
     "languages": [
       {
         "id": "jog",
-        "aliases": ["Jog", "jog"],
-        "extensions": [".jog"],
+        "aliases": [
+          "Jog",
+          "jog"
+        ],
+        "extensions": [
+          ".jog"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],
@@ -32,12 +41,12 @@
         "jog.serverPath": {
           "type": "string",
           "default": "",
-          "description": "Path to the Jog language server executable. Empty uses the bundled server, then server/out/server.exe in the JogLSP checkout."
+          "description": "Path to the Jog language server executable. Empty uses the bundled bin/server (or server.exe), then server/out/server in the JogLSP checkout."
         },
         "jog.compilerPath": {
           "type": "string",
-          "default": "D:\\Projects\\Jog\\JogCompiler\\build\\jog.exe",
-          "description": "Path to jog.exe. A value set in user or workspace settings wins. Otherwise the JOG environment variable, then this default. The language server runs jog check --diag=json on the saved file and passes no --module flags."
+          "default": "",
+          "description": "Path to the jog (or jogc) binary. A value set in user or workspace settings wins. Otherwise the JOG environment variable, then ~/.local/bin/jog, then the historical Windows seed path. The language server runs jog check --diag=json on the saved file and passes no --module flags."
         }
       }
     }
