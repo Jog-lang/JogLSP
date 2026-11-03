@@ -1,5 +1,9 @@
 // Tiny host helpers for the server tests and for finding a temp directory.
 // mkdir parents are not created. An existing directory is false.
+import std.mem
+
+// Keep the import live: seed does not count `with (a: mem.Allocator)` on expect.
+val host_allocator_size: usize = size(mem.Allocator)
 
 expect fn host_mkdir(path: str): bool
 expect fn host_remove_file(path: str)

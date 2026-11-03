@@ -544,6 +544,7 @@ fn *Parser.parse_array(): (Json, bool) with (a: mem.Allocator) {
         arr.release()
         return Json(), false
     }
+    return arr, true
 }
 
 fn *Parser.parse_object(): (Json, bool) with (a: mem.Allocator) {
@@ -595,6 +596,7 @@ fn *Parser.parse_object(): (Json, bool) with (a: mem.Allocator) {
         obj.release()
         return Json(), false
     }
+    return obj, true
 }
 
 fn *Parser.parse_any(): (Json, bool) with (a: mem.Allocator) {
