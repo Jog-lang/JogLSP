@@ -3,3 +3,4 @@ editors/vscode/node_modules/
 editors/vscode/out/
 editors/vscode/bin/
 editors/vscode/*.vsix
+jog.lock
