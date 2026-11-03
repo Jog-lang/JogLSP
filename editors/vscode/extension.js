@@ -48,10 +48,24 @@ function activate(context) {
   output.appendLine("server: " + server);
   output.appendLine("compiler: " + jog);
 
+  // In-process analyze uses argv[0] (the server) for locate_roots, not the
+  // jog binary. Forward JOG_ROOT so std/core/runtime resolve like the CLI.
+  const jogRoot =
+    vscode.workspace.getConfiguration("jog").get("root") ||
+    process.env.JOG_ROOT ||
+    "";
+  if (jogRoot) {
+    output.appendLine("JOG_ROOT: " + jogRoot);
+  }
+  const serverEnv = Object.assign({}, process.env, { JOG: jog });
+  if (jogRoot) {
+    serverEnv.JOG_ROOT = jogRoot;
+  }
+
   const serverOptions = {
     command: server,
     args: [jog],
-    options: { env: Object.assign({}, process.env, { JOG: jog }) },
+    options: { env: serverEnv },
   };
   const clientOptions = {
     documentSelector: [{ scheme: "file", language: "jog" }],
