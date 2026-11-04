@@ -196,7 +196,7 @@ fn *Server.on_hover(id: *Json, params: *Json, out: *strbuilder.StrBuilder) with 
         return
     }
     var contents = j_obj()
-    contents.put_str("kind", "plaintext")
+    contents.put_str("kind", "markdown")
     contents.put_str("value", hover)
     var result = j_obj()
     result.put("contents", contents)

@@ -11,16 +11,40 @@
     { "include": "#number" }
   ],
   "repository": {
+    "doc-tags": {
+      "patterns": [
+        {
+          "match": "(@param)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.other.documentation.jog" },
+            "2": { "name": "variable.other.documentation.jog" }
+          }
+        },
+        {
+          "match": "(@(?:return|context|throws|param))\\b",
+          "name": "keyword.other.documentation.jog"
+        },
+        {
+          "match": "(@[A-Za-z_][A-Za-z0-9_]*)",
+          "name": "keyword.other.documentation.jog"
+        }
+      ]
+    },
     "comment-line": {
       "name": "comment.line.double-slash.jog",
-      "match": "//.*"
+      "begin": "//",
+      "end": "$",
+      "patterns": [
+        { "include": "#doc-tags" }
+      ]
     },
     "comment-block": {
       "name": "comment.block.jog",
       "begin": "/\\*",
       "end": "\\*/",
       "patterns": [
-        { "include": "#comment-block" }
+        { "include": "#comment-block" },
+        { "include": "#doc-tags" }
       ]
     },
     "string": {
