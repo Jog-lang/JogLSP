@@ -2,7 +2,7 @@
 
 Syntax highlighting for `.jog` files, and language-server features from JogLSP: diagnostics on open/change/save, document symbols, hover, go to definition, and completion.
 
-The client starts `bin/server` (or `bin/server.exe` on Windows) when this extension is installed, or `server/out/server` when it is running from the JogLSP checkout. The server loads the JogCompiler **develop** frontend in-process (`require jogc`); it no longer spawns `jog check` for diagnostics. Build the server against a develop checkout (`jog build -o out/server --module jogc=../../JogCompiler` from `server/`).
+The client starts `bin/server` (or `bin/server.exe` on Windows) when this extension is installed, or `server/out/server` when it is running from the JogLSP checkout. The server loads the JogCompiler **develop** frontend in-process (`require jogc`); it no longer spawns `jog check` for diagnostics. Build the server against a develop checkout (`jog-build build -o out/server` from `server/`, with `JOG_ROOT` pointing at JogCompiler develop). Rebuild after compiler `jog.mod` changes (for example `require.test` / `libdir`) so the embedded frontend stays current.
 
 Settings:
 

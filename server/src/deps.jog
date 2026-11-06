@@ -9,7 +9,7 @@ import std.mem
 import std.os
 import std.proc
 
-expect fn deps_flags_argv(root: str, tool: str): lists.List<str> with (a: mem.Allocator)
+expect fn deps_flags_argv(root: str, tool: str, include_test: bool): lists.List<str> with (a: mem.Allocator)
 
 fn is_ascii_space(c: u8): bool {
     return c == ' ' as u8 || c == '\t' as u8 || c == '\n' as u8 || c == '\r' as u8
@@ -74,6 +74,13 @@ fn module_root_of(file_path: str): str with (a: mem.Allocator) {
 
 fn line_is_require(line: str): bool {
     val t = trim_ascii(line)
+    if starts_with(t, "require.test") {
+        if t.len == 12 {
+            return true
+        }
+        val next = t.ptr[12]
+        return next == ' ' as u8 || next == '\t' as u8
+    }
     if !starts_with(t, "require") {
         return false
     }
@@ -82,6 +89,14 @@ fn line_is_require(line: str): bool {
     }
     val next = t.ptr[7]
     return next == ' ' as u8 || next == '\t' as u8
+}
+
+/** True for `*.test.jog` buffers that need `deps --flags --test`. */
+fn path_needs_test_deps(path: str): bool {
+    if path.len < 9 {
+        return false
+    }
+    return ends_with_str(path, ".test.jog")
 }
 
 fn mod_has_require(root: str): bool with (a: mem.Allocator) {
@@ -197,9 +212,9 @@ fn trim_message(text: str): str with (a: mem.Allocator) {
 
 // ok means stdout held --module flags. On failure err is a short message
 // from stderr (or a fixed fallback). flags is empty when !ok.
-fn fetch_module_flags(root: str, tool: str): (lists.List<str>, str, bool) with (a: mem.Allocator) {
+fn fetch_module_flags(root: str, tool: str, include_test: bool): (lists.List<str>, str, bool) with (a: mem.Allocator) {
     var empty: lists.List<str>
-    var argv = deps_flags_argv(root, tool)
+    var argv = deps_flags_argv(root, tool, include_test)
     var (output, err) = proc.run(argv.items())
     free_strs(&argv)
     defer proc.free_output(output)
