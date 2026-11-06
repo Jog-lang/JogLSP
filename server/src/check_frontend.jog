@@ -66,7 +66,7 @@ fn *Server.run_analyze(path: str): (lists.List<Diag>, bool) with (a: mem.Allocat
     val root = module_root_of(path)
     if root.len > 0 && mod_has_require(root) {
         val tool = resolve_jog_build(self.jog)
-        var (raw, err, ok) = fetch_module_flags(root, tool)
+        var (raw, err, ok) = fetch_module_flags(root, tool, path_needs_test_deps(path))
         if ok {
             flags = module_flag_values(raw)
             free_strs(&raw)

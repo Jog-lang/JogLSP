@@ -2,13 +2,17 @@ import std.list as lists
 import std.mem
 import std.strbuilder
 
-actual fn deps_flags_argv(root: str, tool: str): lists.List<str> with (a: mem.Allocator) {
+actual fn deps_flags_argv(root: str, tool: str, include_test: bool): lists.List<str> with (a: mem.Allocator) {
     var script = strbuilder.empty()
     script.append("cd /d \"")
     script.append(root)
     script.append("\" && \"")
     script.append(tool)
-    script.append("\" deps --flags")
+    if include_test {
+        script.append("\" deps --flags --test")
+    } else {
+        script.append("\" deps --flags")
+    }
     val body = copy_str(script.str())
     script.free()
     var args: lists.List<str>
