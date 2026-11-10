@@ -1,7 +1,7 @@
 // On save, when jog.mod has require lines, the server asks jog-build for
 // --module flags (deps --flags) and passes them to jog check. jog-build
-// reads the module from the process cwd, and std.proc.run cannot set cwd,
-// so the host files build a small shell/cmd argv that cds first.
+// reads the module from the process cwd; proc.run's optional cwd runs the
+// child in the saved file's module root.
 
 import std.fs
 import std.list as lists
@@ -200,7 +200,7 @@ fn trim_message(text: str): str with (a: mem.Allocator) {
 fn fetch_module_flags(root: str, tool: str): (lists.List<str>, str, bool) with (a: mem.Allocator) {
     var empty: lists.List<str>
     var argv = deps_flags_argv(root, tool)
-    var (output, err) = proc.run(argv.items())
+    var (output, err) = proc.run(argv.items(), root)
     free_strs(&argv)
     defer proc.free_output(output)
     if err != null {
