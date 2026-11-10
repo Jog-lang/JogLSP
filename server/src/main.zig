@@ -98,8 +98,10 @@ const Server = struct {
                         .change = 1, // Full
                         .save = .{ .includeText = true },
                     },
+                    .hoverProvider = true,
+                    .definitionProvider = true,
                 },
-                .serverInfo = .{ .name = "jog-lsp", .version = "0.2.0-v2" },
+                .serverInfo = .{ .name = "jog-lsp", .version = "0.2.1-v2" },
             });
             return;
         }
@@ -155,6 +157,66 @@ const Server = struct {
             try std.json.stringify(uri, .{}, empty.writer(self.allocator));
             try empty.appendSlice(self.allocator, ",\"diagnostics\":[]}}");
             try self.writeRaw(empty.items);
+            return;
+        }
+        if (std.mem.eql(u8, method.string, "textDocument/hover")) {
+            const params = root.object.get("params").?;
+            const uri = params.object.get("textDocument").?.object.get("uri").?.string;
+            const pos = params.object.get("position").?;
+            const line: i64 = switch (pos.object.get("line").?) {
+                .integer => |n| n,
+                else => 0,
+            };
+            const character: i64 = switch (pos.object.get("character").?) {
+                .integer => |n| n,
+                else => 0,
+            };
+            const text = self.documents.get(uri) orelse {
+                try self.reply(id, null);
+                return;
+            };
+            if (findSymbolAt(text, @intCast(line), @intCast(character))) |sym| {
+                if (findDeclLine(text, sym)) |decl| {
+                    const md = try std.fmt.allocPrint(self.allocator, "```jog\n{s}\n```", .{decl});
+                    defer self.allocator.free(md);
+                    try self.reply(id, .{
+                        .contents = .{ .kind = "markdown", .value = md },
+                    });
+                    return;
+                }
+            }
+            try self.reply(id, null);
+            return;
+        }
+        if (std.mem.eql(u8, method.string, "textDocument/definition")) {
+            const params = root.object.get("params").?;
+            const uri = params.object.get("textDocument").?.object.get("uri").?.string;
+            const pos = params.object.get("position").?;
+            const line: i64 = switch (pos.object.get("line").?) {
+                .integer => |n| n,
+                else => 0,
+            };
+            const character: i64 = switch (pos.object.get("character").?) {
+                .integer => |n| n,
+                else => 0,
+            };
+            const text = self.documents.get(uri) orelse {
+                try self.reply(id, null);
+                return;
+            };
+            if (findSymbolAt(text, @intCast(line), @intCast(character))) |sym| {
+                if (findDeclLocation(text, sym)) |loc| {
+                    try self.reply(id, .{
+                        .uri = uri,
+                        .range = .{
+                            .start = .{ .line = loc.line, .character = loc.character },
+                            .end = .{ .line = loc.line, .character = loc.character + sym.len },
+                        },
+                    });
+                    return;
+                }
+            }
+            try self.reply(id, null);
             return;
         }
     }
@@ -299,6 +361,93 @@ const Diag = struct {
     line: u32,
     character: u32,
 };
+
+const DeclLoc = struct { line: u32, character: u32 };
+
+fn isIdentChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+}
+
+fn findSymbolAt(text: []const u8, line: u32, character: u32) ?[]const u8 {
+    var line_i: u32 = 0;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (line_i == line) {
+            const line_start = i;
+            while (i < text.len and text[i] != '\n') : (i += 1) {}
+            const line_text = text[line_start..i];
+            if (character >= line_text.len) return null;
+            var start = character;
+            while (start > 0 and isIdentChar(line_text[start - 1])) : (start -= 1) {}
+            var end = character;
+            while (end < line_text.len and isIdentChar(line_text[end])) : (end += 1) {}
+            if (start == end) return null;
+            return line_text[start..end];
+        }
+        if (text[i] == '\n') line_i += 1;
+    }
+    return null;
+}
+
+fn findDeclLine(text: []const u8, name: []const u8) ?[]const u8 {
+    var line_start: usize = 0;
+    var i: usize = 0;
+    while (i <= text.len) : (i += 1) {
+        if (i == text.len or text[i] == '\n') {
+            const line = text[line_start..i];
+            if (lineContainsDecl(line, name)) {
+                return std.mem.trim(u8, line, " \t\r");
+            }
+            line_start = i + 1;
+        }
+    }
+    return null;
+}
+
+fn findDeclLocation(text: []const u8, name: []const u8) ?DeclLoc {
+    var line_i: u32 = 0;
+    var line_start: usize = 0;
+    var i: usize = 0;
+    while (i <= text.len) : (i += 1) {
+        if (i == text.len or text[i] == '\n') {
+            const line = text[line_start..i];
+            if (lineContainsDecl(line, name)) {
+                if (std.mem.indexOf(u8, line, name)) |col| {
+                    return .{ .line = line_i, .character = @intCast(col) };
+                }
+            }
+            line_start = i + 1;
+            line_i += 1;
+        }
+    }
+    return null;
+}
+
+fn lineContainsDecl(line: []const u8, name: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t");
+    const prefixes = [_][]const u8{ "fn ", "struct ", "type ", "interface ", "val ", "var " };
+    for (prefixes) |p| {
+        if (std.mem.startsWith(u8, trimmed, p)) {
+            const rest = trimmed[p.len..];
+            // skip * for methods
+            var r = rest;
+            if (r.len > 0 and r[0] == '*') r = r[1..];
+            if (std.mem.startsWith(u8, r, name)) {
+                const after = r[name.len..];
+                if (after.len == 0 or !isIdentChar(after[0])) return true;
+            }
+            // method Type.name
+            if (std.mem.indexOfScalar(u8, r, '.')) |dot| {
+                const after_dot = r[dot + 1 ..];
+                if (std.mem.startsWith(u8, after_dot, name)) {
+                    const after = after_dot[name.len..];
+                    if (after.len == 0 or !isIdentChar(after[0])) return true;
+                }
+            }
+        }
+    }
+    return false;
+}
 
 fn resolveJog(allocator: std.mem.Allocator, arg: ?[]const u8) ![]u8 {
     if (arg) |a| {
