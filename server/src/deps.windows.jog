@@ -1,19 +1,11 @@
 import std.list as lists
 import std.mem
-import std.strbuilder
 
 actual fn deps_flags_argv(root: str, tool: str): lists.List<str> with (a: mem.Allocator) {
-    var script = strbuilder.empty()
-    script.append("cd /d \"")
-    script.append(root)
-    script.append("\" && \"")
-    script.append(tool)
-    script.append("\" deps --flags")
-    val body = copy_str(script.str())
-    script.free()
+    _ = root
     var args: lists.List<str>
-    args.push(copy_str("cmd.exe"))
-    args.push(copy_str("/c"))
-    args.push(body)
+    args.push(copy_str(tool))
+    args.push(copy_str("deps"))
+    args.push(copy_str("--flags"))
     return args
 }
