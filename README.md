@@ -1,59 +1,33 @@
-# JogLSP
+# JogLSP (v2)
 
-A diagnostics-only language server for Jog. The server is written in Jog. It speaks Language Server Protocol messages over stdin and stdout, and on save it runs `jog check --diag=json`.
+Zig language server for **JogCompiler v2**. Diagnostics come from `jog check --diag=json` (no in-process jogc frontend).
 
-The compiler command is `jog`. On this machine the binary is `D:\Projects\Jog\JogCompiler\build\jog.exe`. When `JOG` is set, that path is the compiler. Standard library packages are found relative to the binary.
+v1 (Jog server + `require jogc`) stays on `main` and older branches.
 
-## Start here
-
-The design notes live in JogDocs, at `D:/Projects/Jog/JogDocs` ([github.com/Jog-lang/JogDocs](https://github.com/Jog-lang/JogDocs)), not in this repo:
-
-- `AGENTS.md` and `guide/JogQuickRef.md`: how the notes are organized, and what V1 compiles.
-- `projects/JogLSP.md`: this project's note.
-- `bootstrap/study/LSP.md`: the protocol, framing, and positions.
-- `bootstrap/Checks.md`, section P2: the checklist for this server.
-
-`notes/README.md` here only points to those files.
-
-## Server
-
-`server/jog.mod` marks the module root. `server/main.jog` is the root package and starts `src.serve`. The server itself is the `src` package. The loader always builds that root, so the commands below are run from `server/` with no package argument.
-
-From `server/`:
+## Build server
 
 ```
-jog test
-jog build
+export JOG=~/.local/bin/jog-v2   # or JogCompiler-v2/zig-out/bin/jog
+cd server
+zig build
+cp zig-out/bin/server ../editors/vscode/bin/server
 ```
-
-`jog build` writes `server/out/server.exe`. `jog test` writes that same path, so build again after a test run when you want the server rather than the test runner. The process reads framed messages from stdin and writes them to stdout. Logs go to stderr. On Windows the server sets stdin and stdout to binary mode so `Content-Length` counts bytes.
-
-On save the server runs `jog check` on the file on disk, with `--diag=json`. When that module’s `jog.mod` has `require` lines, it first runs `jog-build deps --flags` in the module root and appends those `--module=…` arguments. The compiler path is the first argument, or the `JOG` environment variable when that argument is absent. `jog-build` is `JOG_BUILD`, else a binary next to `jog`, else `jog-build` on `PATH`.
 
 ## Editor
 
-`editors/vscode` is a VS Code and Cursor extension: a TextMate grammar, a language configuration, and a small client that starts the language server. Highlighting comes from the grammar and does not need the server.
-
-From `editors/vscode`, with `server/out/server` already built (`.exe` on Windows):
-
-**Linux**
-
 ```
+cd editors/vscode
 npm install
-cp ../../server/out/server bin/server
+# ensure bin/server exists (copied above)
 npx @vscode/vsce package --allow-missing-repository
 cursor --install-extension jog-0.0.1.vsix --force
 ```
 
-**Windows**
+Settings: `jog.compilerPath` → v2 `jog` (or `jog-v2`). The client still passes that path as argv[1] and sets `JOG`.
 
-```
-npm install
-Copy-Item ..\..\server\out\server.exe bin\server.exe
-npx @vscode/vsce package --allow-missing-repository
-cursor --install-extension jog-0.0.1.vsix --force
-```
+## Capabilities (v2 MVP)
 
-Reload the window after installing. The client starts `bin/server` / `bin/server.exe`, or `server/out/server` from this checkout. It passes `jog.compilerPath` when that setting is set in user or workspace settings; otherwise it uses `JOG`, then `~/.local/bin/jog`, then the historical Windows seed path.
+- `textDocumentSync` (full)
+- Diagnostics on open / change / save via `jog check --diag=json`
 
-P2 editor smoke: `JOG=/path/to/jog node editors/vscode/verify-p2.js`.
+Hover, definition, completion, and jog-build `--module` deps are deferred until the v2 compiler exposes them.

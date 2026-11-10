@@ -32,6 +32,8 @@ function resolveCompilerExecutable(explicit, envJog, home) {
   return firstExisting([
     explicit,
     envJog,
+    path.join(homeDir, ".local", "bin", "jog-v2"),
+    path.join(homeDir, "Documents", "Projects", "Jog", "JogCompiler-v2", "zig-out", "bin", "jog"),
     path.join(homeDir, ".local", "bin", "jog"),
     "D:\\Projects\\Jog\\JogCompiler\\build\\jog.exe",
   ]);
