@@ -1,0 +1,12 @@
+.{
+    .name = .jog_lsp_server,
+    .version = "0.2.0",
+    .fingerprint = 0x81c9e80e24d7632a,
+    .minimum_zig_version = "0.14.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

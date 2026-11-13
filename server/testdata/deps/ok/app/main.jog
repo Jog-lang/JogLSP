@@ -1,5 +1,0 @@
-import greeter
-
-fn main() {
-    val s = greeter.hello()
-}

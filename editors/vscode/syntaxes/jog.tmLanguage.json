@@ -8,6 +8,8 @@
     { "include": "#attribute" },
     { "include": "#function" },
     { "include": "#keyword" },
+    { "include": "#support-type" },
+    { "include": "#support-function" },
     { "include": "#number" }
   ],
   "repository": {
@@ -119,8 +121,16 @@
       }
     },
     "keyword": {
-      "match": "\\b(fn|var|val|type|struct|interface|enum|if|else|when|for|in|break|continue|return|defer|errdefer|go|with|context|private|import|as|is|null|true|false|bytes|op|escaping|const|extern|expect|actual|quote)\\b",
+      "match": "\\b(fn|var|val|type|struct|interface|enum|if|else|when|for|in|break|continue|return|defer|errdefer|go|yield|with|context|private|import|as|is|null|true|false|bytes|op|escaping|const|extern|expect|actual|quote)\\b",
       "name": "keyword.control.jog"
+    },
+    "support-type": {
+      "match": "\\b(Dispatcher|byte|bool|u16|u32|u64|i32|i64|usize|str|void)\\b",
+      "name": "support.type.jog"
+    },
+    "support-function": {
+      "match": "\\b(dispatcher_io|dispatcher_single|dispatcher_pool|dispatcher_new|dispatcher_get|coro_drain|coro_alive|coro_id|coro_park|coro_unpark|spawn|sleep_ms|print_tid|worker_id|gettid|print|alloc)\\b",
+      "name": "support.function.jog"
     },
     "number": {
       "match": "\\b(?:0[xX][0-9A-Fa-f_]+|0[bB][01_]+|0[oO][0-7_]+|[0-9][0-9_]*(?:\\.[0-9_]+)?(?:[eE][+-]?[0-9_]+)?)\\b",

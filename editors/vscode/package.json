@@ -46,12 +46,12 @@
         "jog.compilerPath": {
           "type": "string",
           "default": "",
-          "description": "Path to the jog (or jogc) binary. A value set in user or workspace settings wins. Otherwise the JOG environment variable, then ~/.local/bin/jog, then the historical Windows seed path. The language server runs jog check --diag=json on the saved file and passes no --module flags."
+          "description": "Path to JogCompiler v2 jog (or jog-v2). User/workspace settings win, then JOG, then ~/.local/bin/jog-v2, then sibling JogCompiler-v2 zig-out, then PATH. The v2 language server runs jog check --diag=json and serves concurrency-aware hover/completion."
         },
         "jog.root": {
           "type": "string",
           "default": "",
-          "description": "Directory that contains std/, core/, and runtime/ (same meaning as JOG_ROOT). Needed when the language server binary is not installed next to those trees; empty falls back to the JOG_ROOT environment variable."
+          "description": "Optional JOG_ROOT. v2 diagnostics do not require std/ next to the binary yet; kept for forward compatibility."
         }
       }
     }
