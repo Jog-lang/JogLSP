@@ -1,39 +1,30 @@
-# Jog for VS Code and Cursor
+# Jog for VS Code and Cursor (v2)
 
-Syntax highlighting for `.jog` files, and language-server features from JogLSP: diagnostics on open/change/save, document symbols, hover, go to definition, and completion.
+Syntax highlighting for `.jog` files, and language-server features from JogLSP **v2**: diagnostics via `jog check --diag=json`, hover, go-to-definition, and completion (including post-concurrency builtins).
 
-The client starts `bin/server` (or `bin/server.exe` on Windows) when this extension is installed, or `server/out/server` when it is running from the JogLSP checkout. The server loads the JogCompiler **develop** frontend in-process (`require jogc`); it no longer spawns `jog check` for diagnostics. Build the server against a develop checkout (`jog build -o out/server --module jogc=../../JogCompiler` from `server/`).
+The client starts `bin/server` (or `bin/server.exe` on Windows) when this extension is installed, or `server/zig-out/bin/server` when running from the JogLSP checkout. Build the Zig server (`cd server && zig build`) against JogCompiler v2.
 
 Settings:
 
 - `jog.serverPath` — language server executable
-- `jog.compilerPath` — seed `jog` binary used to build/run tools and resolve `jog-build` (else `JOG`, else `~/.local/bin/jog`)
+- `jog.compilerPath` — JogCompiler v2 `jog` / `jog-v2` (else `JOG`, else `~/.local/bin/jog-v2`, else sibling checkout)
 
-## Features (P4)
+## Features
 
-- **Diagnostics** — published on `didOpen`, `didChange`, and `didSave` from an in-process load+check (open buffers override disk).
-- **Document symbols** — top-level declarations (functions, types, bindings).
-- **Hover** — type and declaration site when known; empty on unknown/error nodes.
-- **Go to definition** — across files and packages, including std.
-- **Completion** — names in scope; fields/methods after `.` (incomplete tokens still complete).
+- **Diagnostics** — `didOpen` / `didChange` / `didSave` → `jog check --diag=json` on a temp copy of the buffer
+- **Hover** — local decls; concurrency builtins (`go`, `yield`, `with`, `Dispatcher`, `dispatcher_io`, …)
+- **Go to definition** — buffer-local decls (builtins have no source location)
+- **Completion** — concurrency APIs + top-level names in the open buffer
+- **Syntax** — TextMate keywords include `go` / `yield` / `with`; support scopes for `Dispatcher` and dispatcher/coro helpers
 
 ## Install (Linux / Cursor)
 
-From this directory, with `server/out/server` already built:
-
 ```
+cd ../../server && zig build && cp zig-out/bin/server ../editors/vscode/bin/server
+cd ../editors/vscode
 npm install
-cp ../../server/out/server bin/server
 npx @vscode/vsce package --allow-missing-repository
 cursor --install-extension jog-0.0.1.vsix --force
 ```
 
-Set `JOG` to your seed `jog` (or set `jog.compilerPath`). Reload the window after installing.
-
-## Verify P2 editor boxes
-
-```
-JOG=~/.local/bin/jog node verify-p2.js
-```
-
-That script checks the TextMate grammar contribution, language configuration (comments / brackets / auto-close), save-time diagnostics that clear on a fixed save, and clean `shutdown`/`exit` with no leftover server pid.
+Set `JOG` or `jog.compilerPath` to your v2 `jog`. Reload the window after installing.
