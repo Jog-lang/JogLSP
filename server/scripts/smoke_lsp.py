@@ -212,12 +212,32 @@ def main() -> int:
         caps = init["result"]["capabilities"]
         assert caps.get("hoverProvider") is True
         assert caps.get("definitionProvider") is True
+        assert caps.get("documentSymbolProvider") is True
         assert "completionProvider" in caps
         ver = init["result"]["serverInfo"]["version"]
-        print("initialize ok", ver, "caps completion+hover+definition")
+        print("initialize ok", ver, "caps completion+hover+definition+symbols")
         lsp.send("initialized", {}, as_request=False)
 
         check_file(lsp, EXAMPLES / "hello.jog", expect_clean=True)
+
+        # document symbols via jog symbols --json
+        hello = EXAMPLES / "hello.jog"
+        htext = hello.read_text()
+        with tempfile.NamedTemporaryFile("w", suffix=".jog", delete=False) as f:
+            f.write(htext)
+            htmp = Path(f.name)
+        huri = uri_for(htmp)
+        lsp.send("textDocument/didOpen", {
+            "textDocument": {"uri": huri, "languageId": "jog", "version": 1, "text": htext},
+        }, as_request=False)
+        lsp.wait_notification("textDocument/publishDiagnostics")
+        sid = lsp.send("textDocument/documentSymbol", {"textDocument": {"uri": huri}})
+        syms = lsp.wait_response(sid)
+        labels = [it["name"] for it in (syms.get("result") or [])]
+        if "main" not in labels:
+            raise AssertionError(f"documentSymbol missing main: {labels}")
+        print("  documentSymbol: ok", labels)
+        htmp.unlink(missing_ok=True)
         check_file(
             lsp,
             EXAMPLES / "coro_yield.jog",

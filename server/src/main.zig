@@ -1,8 +1,9 @@
 const std = @import("std");
 
-/// JogLSP for JogCompiler v2 (post-concurrency): diagnostics via `jog check --diag=json`,
-/// plus buffer-local hover / definition / completion with concurrency builtins.
-/// argv[1] or JOG / jog-v2 / sibling JogCompiler-v2 selects the compiler.
+/// JogLSP for JogCompiler v2: diagnostics via `jog check --diag=json` (+ `--module`
+/// from `jog deps --flags` when jog.mod has path requires), document symbols via
+/// `jog symbols --json`, plus buffer-local hover / definition / completion with
+/// concurrency builtins. argv[1] or JOG / jog-v2 / sibling JogCompiler-v2 selects jog.
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -100,12 +101,13 @@ const Server = struct {
                     },
                     .hoverProvider = true,
                     .definitionProvider = true,
+                    .documentSymbolProvider = true,
                     .completionProvider = .{
                         .triggerCharacters = .{ ".", "(" },
                         .resolveProvider = false,
                     },
                 },
-                .serverInfo = .{ .name = "jog-lsp", .version = "0.2.3-v2" },
+                .serverInfo = .{ .name = "jog-lsp", .version = "0.2.8-v2" },
             });
             return;
         }
@@ -302,6 +304,81 @@ const Server = struct {
             try self.writeRaw(msg.items);
             return;
         }
+        if (std.mem.eql(u8, method.string, "textDocument/documentSymbol")) {
+            const params = root.object.get("params").?;
+            const uri = params.object.get("textDocument").?.object.get("uri").?.string;
+            const text = self.documents.get(uri) orelse {
+                try self.reply(id, &.{});
+                return;
+            };
+            const path = try uriToPath(self.allocator, uri);
+            defer self.allocator.free(path);
+            const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.jog-lsp-tmp", .{path});
+            defer self.allocator.free(tmp_path);
+            {
+                const f = try std.fs.cwd().createFile(tmp_path, .{});
+                defer f.close();
+                try f.writeAll(text);
+            }
+            defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+            var child = std.process.Child.init(&.{ self.jog, "symbols", "--json", tmp_path }, self.allocator);
+            child.stdout_behavior = .Pipe;
+            child.stderr_behavior = .Ignore;
+            try child.spawn();
+            const out = try child.stdout.?.readToEndAlloc(self.allocator, 2 * 1024 * 1024);
+            defer self.allocator.free(out);
+            _ = try child.wait();
+
+            var result_buf: std.ArrayListUnmanaged(u8) = .{};
+            defer result_buf.deinit(self.allocator);
+            try result_buf.append(self.allocator, '[');
+            var first = true;
+            var lines = std.mem.splitScalar(u8, out, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                const obj = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
+                defer obj.deinit();
+                if (obj.value != .object) continue;
+                const name = if (obj.value.object.get("name")) |n| (if (n == .string) n.string else continue) else continue;
+                const kind_s = if (obj.value.object.get("kind")) |k| (if (k == .string) k.string else "function") else "function";
+                const line_n: i64 = if (obj.value.object.get("line")) |l| switch (l) {
+                    .integer => l.integer,
+                    else => 1,
+                } else 1;
+                const col_n: i64 = if (obj.value.object.get("column")) |c| switch (c) {
+                    .integer => c.integer,
+                    else => 1,
+                } else 1;
+                const kind: u8 = if (std.mem.eql(u8, kind_s, "function")) 12 else if (std.mem.eql(u8, kind_s, "struct")) 23 else if (std.mem.eql(u8, kind_s, "enum")) 10 else if (std.mem.eql(u8, kind_s, "interface")) 11 else if (std.mem.eql(u8, kind_s, "constant")) 14 else if (std.mem.eql(u8, kind_s, "type")) 26 else 13;
+                const zl: i64 = if (line_n > 0) line_n - 1 else 0;
+                const zc: i64 = if (col_n > 0) col_n - 1 else 0;
+                if (!first) try result_buf.append(self.allocator, ',');
+                first = false;
+                try result_buf.appendSlice(self.allocator, "{\"name\":");
+                try std.json.stringify(name, .{}, result_buf.writer(self.allocator));
+                try result_buf.writer(self.allocator).print(
+                    ",\"kind\":{d},\"range\":{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":{d}}}}},\"selectionRange\":{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":{d}}}}}",
+                    .{ kind, zl, zc, zl, zc + @as(i64, @intCast(name.len)), zl, zc, zl, zc + @as(i64, @intCast(name.len)) },
+                );
+                try result_buf.append(self.allocator, '}');
+            }
+            try result_buf.append(self.allocator, ']');
+
+            var msg: std.ArrayListUnmanaged(u8) = .{};
+            defer msg.deinit(self.allocator);
+            try msg.appendSlice(self.allocator, "{\"jsonrpc\":\"2.0\",\"result\":");
+            try msg.appendSlice(self.allocator, result_buf.items);
+            try msg.appendSlice(self.allocator, ",\"id\":");
+            if (id) |i| {
+                try std.json.stringify(i, .{}, msg.writer(self.allocator));
+            } else {
+                try msg.appendSlice(self.allocator, "null");
+            }
+            try msg.append(self.allocator, '}');
+            try self.writeRaw(msg.items);
+            return;
+        }
     }
 
     fn setDoc(self: *Server, uri: []const u8, text: []const u8) !void {
@@ -323,8 +400,8 @@ const Server = struct {
         defer self.allocator.free(path);
 
         // Write buffer to a temp file so unsaved edits are checked.
-        // Contract: `jog check --diag=json <path>` — JSON lines on stdout
-        // (`file`,`line`,`column`,`severity`,`message`); parse chatter may go to stderr.
+        // Contract: `jog check --diag=json [--module=…] [--test] <path>` —
+        // JSON lines on stdout (`file`,`line`,`column`,`severity`,`message`).
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.jog-lsp-tmp", .{path});
         defer self.allocator.free(tmp_path);
         {
@@ -334,7 +411,37 @@ const Server = struct {
         }
         defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
-        var child = std.process.Child.init(&.{ self.jog, "check", "--diag=json", tmp_path }, self.allocator);
+        var argv: std.ArrayListUnmanaged([]const u8) = .{};
+        defer argv.deinit(self.allocator);
+        try argv.append(self.allocator, self.jog);
+        try argv.append(self.allocator, "check");
+        try argv.append(self.allocator, "--diag=json");
+        if (std.mem.endsWith(u8, path, ".test.jog")) {
+            try argv.append(self.allocator, "--test");
+        }
+        // Path requires from nearest jog.mod → `--module=name=dir`.
+        var flag_storage: std.ArrayListUnmanaged([]u8) = .{};
+        defer {
+            for (flag_storage.items) |s| self.allocator.free(s);
+            flag_storage.deinit(self.allocator);
+        }
+        if (try moduleRootOf(self.allocator, path)) |root| {
+            defer self.allocator.free(root);
+            if (try fetchModuleFlags(self.allocator, self.jog, root, std.mem.endsWith(u8, path, ".test.jog"))) |flags| {
+                defer {
+                    for (flags) |f| self.allocator.free(f);
+                    self.allocator.free(flags);
+                }
+                for (flags) |f| {
+                    const owned = try self.allocator.dupe(u8, f);
+                    try flag_storage.append(self.allocator, owned);
+                    try argv.append(self.allocator, owned);
+                }
+            }
+        }
+        try argv.append(self.allocator, tmp_path);
+
+        var child = std.process.Child.init(argv.items, self.allocator);
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
         try child.spawn();
@@ -650,6 +757,70 @@ fn extractDeclName(line: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+fn parentDir(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    const dir = std.fs.path.dirname(path) orelse return null;
+    return try allocator.dupe(u8, dir);
+}
+
+fn moduleRootOf(allocator: std.mem.Allocator, file_path: []const u8) !?[]u8 {
+    var dir = (try parentDir(allocator, file_path)) orelse return null;
+    while (true) {
+        const mod_path = try std.fs.path.join(allocator, &.{ dir, "jog.mod" });
+        const found = fileExists(mod_path);
+        allocator.free(mod_path);
+        if (found) return dir;
+        const up = (try parentDir(allocator, dir)) orelse {
+            allocator.free(dir);
+            return null;
+        };
+        if (std.mem.eql(u8, up, dir)) {
+            allocator.free(up);
+            allocator.free(dir);
+            return null;
+        }
+        allocator.free(dir);
+        dir = up;
+    }
+}
+
+/// Run `jog deps --flags [--test]` in the module root; returns owned `--module=…` lines.
+fn fetchModuleFlags(allocator: std.mem.Allocator, jog: []const u8, root: []const u8, include_test: bool) !?[][]u8 {
+    var argv: std.ArrayListUnmanaged([]const u8) = .{};
+    defer argv.deinit(allocator);
+    try argv.append(allocator, jog);
+    try argv.append(allocator, "deps");
+    try argv.append(allocator, "--flags");
+    if (include_test) try argv.append(allocator, "--test");
+    try argv.append(allocator, root);
+
+    var child = std.process.Child.init(argv.items, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    child.cwd = root;
+    try child.spawn();
+    const out = try child.stdout.?.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(out);
+    _ = try child.wait();
+
+    var list: std.ArrayListUnmanaged([]u8) = .{};
+    errdefer {
+        for (list.items) |s| allocator.free(s);
+        list.deinit(allocator);
+    }
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (t.len == 0) continue;
+        if (!std.mem.startsWith(u8, t, "--module")) continue;
+        try list.append(allocator, try allocator.dupe(u8, t));
+    }
+    if (list.items.len == 0) {
+        list.deinit(allocator);
+        return null;
+    }
+    return try list.toOwnedSlice(allocator);
 }
 
 fn resolveJog(allocator: std.mem.Allocator, arg: ?[]const u8) ![]u8 {
