@@ -1,10 +1,12 @@
 const std = @import("std");
 
-/// JogLSP for JogCompiler v2: diagnostics via `jog check --diag=json` (+ `--module`
-/// from `jog deps --flags` when jog.mod has path requires), document symbols via
-/// `jog symbols --json`, hover / definition into buffer + `std`/`core` sources
-/// (`jog roots` / `$JOG_ROOT`), and concurrency builtins. argv[1] or JOG / jog-v2 /
-/// sibling JogCompiler-v2 selects jog.
+/// JogLSP for JogCompiler v2: diagnostics via `jog check --diag=json`, IDE
+/// features via `jog ide` (hover/definition/complete/references/symbols), plus
+/// concurrency builtins as fallback when the compiler has no source. argv[1] or
+/// JOG / jog-v2 / sibling JogCompiler-v2 selects jog.
+
+const server_version = "0.2.11-v2";
+const diag_debounce_ms: i64 = 200;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -25,6 +27,8 @@ pub fn main() !void {
     };
     defer {
         allocator.free(server.jog);
+        if (server.root_uri) |r| allocator.free(r);
+        if (server.pending_diag_uri) |u| allocator.free(u);
         var it = server.documents.iterator();
         while (it.next()) |e| {
             allocator.free(e.key_ptr.*);
@@ -42,12 +46,22 @@ const Server = struct {
     stdin: std.fs.File,
     stdout: std.fs.File,
     documents: std.StringHashMapUnmanaged([]u8),
+    root_uri: ?[]u8 = null,
+    pending_diag_uri: ?[]u8 = null,
+    pending_diag_at_ms: i64 = 0,
 
     fn loop(self: *Server) !void {
         var buf: std.ArrayListUnmanaged(u8) = .{};
         defer buf.deinit(self.allocator);
         var tmp: [4096]u8 = undefined;
         while (true) {
+            try self.maybeFlushPendingDiags();
+            const timeout_ms: i32 = if (self.pending_diag_uri != null) 50 else -1;
+            const ready = try pollReadable(self.stdin.handle, timeout_ms);
+            if (!ready) {
+                try self.maybeFlushPendingDiags();
+                continue;
+            }
             const n = self.stdin.read(&tmp) catch |err| switch (err) {
                 error.BrokenPipe => return,
                 else => return err,
@@ -55,6 +69,40 @@ const Server = struct {
             if (n == 0) return;
             try buf.appendSlice(self.allocator, tmp[0..n]);
             while (try self.tryHandleMessage(&buf)) {}
+        }
+    }
+
+    fn maybeFlushPendingDiags(self: *Server) !void {
+        const uri = self.pending_diag_uri orelse return;
+        const now = std.time.milliTimestamp();
+        if (now - self.pending_diag_at_ms < diag_debounce_ms) return;
+        const owned = uri;
+        self.pending_diag_uri = null;
+        defer self.allocator.free(owned);
+        try self.publishDiags(owned);
+    }
+
+    fn scheduleDiags(self: *Server, uri: []const u8) !void {
+        if (self.pending_diag_uri) |old| {
+            if (!std.mem.eql(u8, old, uri)) {
+                // Different doc: flush previous immediately.
+                self.pending_diag_uri = null;
+                defer self.allocator.free(old);
+                try self.publishDiags(old);
+            } else {
+                self.allocator.free(old);
+                self.pending_diag_uri = null;
+            }
+        }
+        self.pending_diag_uri = try self.allocator.dupe(u8, uri);
+        self.pending_diag_at_ms = std.time.milliTimestamp();
+    }
+
+    fn flushPendingBeforeQuery(self: *Server) !void {
+        if (self.pending_diag_uri) |uri| {
+            self.pending_diag_uri = null;
+            defer self.allocator.free(uri);
+            try self.publishDiags(uri);
         }
     }
 
@@ -86,13 +134,21 @@ const Server = struct {
         defer parsed.deinit();
         const root = parsed.value;
         if (root != .object) return;
-        const method = root.object.get("method") orelse {
-            return;
-        };
+        const method = root.object.get("method") orelse return;
         if (method != .string) return;
         const id = root.object.get("id");
 
         if (std.mem.eql(u8, method.string, "initialize")) {
+            if (root.object.get("params")) |params| {
+                if (params == .object) {
+                    if (params.object.get("rootUri")) |ru| {
+                        if (ru == .string and ru.string.len > 0) {
+                            if (self.root_uri) |old| self.allocator.free(old);
+                            self.root_uri = try self.allocator.dupe(u8, ru.string);
+                        }
+                    }
+                }
+            }
             try self.reply(id, .{
                 .capabilities = .{
                     .textDocumentSync = .{
@@ -102,13 +158,20 @@ const Server = struct {
                     },
                     .hoverProvider = true,
                     .definitionProvider = true,
+                    .referencesProvider = true,
                     .documentSymbolProvider = true,
+                    .workspaceSymbolProvider = true,
+                    .renameProvider = .{ .prepareProvider = true },
+                    .signatureHelpProvider = .{
+                        .triggerCharacters = .{"("},
+                        .retriggerCharacters = .{ "," },
+                    },
                     .completionProvider = .{
                         .triggerCharacters = .{ ".", "(" },
                         .resolveProvider = false,
                     },
                 },
-                .serverInfo = .{ .name = "jog-lsp", .version = "0.2.8-v2" },
+                .serverInfo = .{ .name = "jog-lsp", .version = server_version },
             });
             return;
         }
@@ -137,12 +200,13 @@ const Server = struct {
                 const last = changes.items[changes.items.len - 1];
                 if (last.object.get("text")) |t| {
                     try self.setDoc(uri, t.string);
-                    try self.publishDiags(uri);
+                    try self.scheduleDiags(uri);
                 }
             }
             return;
         }
         if (std.mem.eql(u8, method.string, "textDocument/didSave")) {
+            try self.flushPendingBeforeQuery();
             const params = root.object.get("params").?;
             const uri = params.object.get("textDocument").?.object.get("uri").?.string;
             if (params.object.get("text")) |t| {
@@ -154,6 +218,12 @@ const Server = struct {
         if (std.mem.eql(u8, method.string, "textDocument/didClose")) {
             const params = root.object.get("params").?;
             const uri = params.object.get("textDocument").?.object.get("uri").?.string;
+            if (self.pending_diag_uri) |p| {
+                if (std.mem.eql(u8, p, uri)) {
+                    self.allocator.free(p);
+                    self.pending_diag_uri = null;
+                }
+            }
             if (self.documents.fetchRemove(uri)) |kv| {
                 self.allocator.free(kv.key);
                 self.allocator.free(kv.value);
@@ -167,246 +237,518 @@ const Server = struct {
             return;
         }
         if (std.mem.eql(u8, method.string, "textDocument/hover")) {
-            const params = root.object.get("params").?;
-            const uri = params.object.get("textDocument").?.object.get("uri").?.string;
-            const pos = params.object.get("position").?;
-            const line: i64 = switch (pos.object.get("line").?) {
-                .integer => |n| n,
-                else => 0,
-            };
-            const character: i64 = switch (pos.object.get("character").?) {
-                .integer => |n| n,
-                else => 0,
-            };
-            const text = self.documents.get(uri) orelse {
-                try self.reply(id, null);
-                return;
-            };
-            if (findSymbolAt(text, @intCast(line), @intCast(character))) |sym| {
-                if (findDeclLine(text, sym)) |decl| {
-                    const md = try std.fmt.allocPrint(self.allocator, "```jog\n{s}\n```", .{decl});
-                    defer self.allocator.free(md);
-                    try self.reply(id, .{
-                        .contents = .{ .kind = "markdown", .value = md },
-                    });
-                    return;
-                }
-                if (try findLibraryDeclLine(self.allocator, self.jog, text, sym)) |lib| {
-                    defer self.allocator.free(lib.line);
-                    defer self.allocator.free(lib.path);
-                    const md = try std.fmt.allocPrint(
-                        self.allocator,
-                        "```jog\n{s}\n```\n\n_{s}_",
-                        .{ lib.line, lib.path },
-                    );
-                    defer self.allocator.free(md);
-                    try self.reply(id, .{
-                        .contents = .{ .kind = "markdown", .value = md },
-                    });
-                    return;
-                }
-                if (lookupBuiltin(sym)) |b| {
-                    const md = try std.fmt.allocPrint(
-                        self.allocator,
-                        "```jog\n{s}\n```\n\n{s}",
-                        .{ b.signature, b.doc },
-                    );
-                    defer self.allocator.free(md);
-                    try self.reply(id, .{
-                        .contents = .{ .kind = "markdown", .value = md },
-                    });
-                    return;
-                }
-            }
-            try self.reply(id, null);
+            try self.flushPendingBeforeQuery();
+            try self.handleHover(id, root.object.get("params").?);
             return;
         }
         if (std.mem.eql(u8, method.string, "textDocument/definition")) {
-            const params = root.object.get("params").?;
-            const uri = params.object.get("textDocument").?.object.get("uri").?.string;
-            const pos = params.object.get("position").?;
-            const line: i64 = switch (pos.object.get("line").?) {
-                .integer => |n| n,
-                else => 0,
-            };
-            const character: i64 = switch (pos.object.get("character").?) {
-                .integer => |n| n,
-                else => 0,
-            };
-            const text = self.documents.get(uri) orelse {
-                try self.reply(id, null);
-                return;
-            };
-            if (findSymbolAt(text, @intCast(line), @intCast(character))) |sym| {
-                if (findDeclLocation(text, sym)) |loc| {
-                    try self.reply(id, .{
-                        .uri = uri,
-                        .range = .{
-                            .start = .{ .line = loc.line, .character = loc.character },
-                            .end = .{ .line = loc.line, .character = loc.character + sym.len },
-                        },
-                    });
-                    return;
-                }
-                if (try findLibraryDeclLocation(self.allocator, self.jog, text, sym)) |lib| {
-                    defer self.allocator.free(lib.path);
-                    const file_uri = try pathToFileUri(self.allocator, lib.path);
-                    defer self.allocator.free(file_uri);
-                    try self.reply(id, .{
-                        .uri = file_uri,
-                        .range = .{
-                            .start = .{ .line = lib.line, .character = lib.character },
-                            .end = .{ .line = lib.line, .character = lib.character + sym.len },
-                        },
-                    });
-                    return;
-                }
-                // Builtins / unresolved: no source location.
-                if (lookupBuiltin(sym) != null) {
-                    try self.reply(id, null);
-                    return;
-                }
-            }
-            try self.reply(id, null);
+            try self.flushPendingBeforeQuery();
+            try self.handleDefinition(id, root.object.get("params").?);
             return;
         }
         if (std.mem.eql(u8, method.string, "textDocument/completion")) {
-            const params = root.object.get("params").?;
-            const uri = params.object.get("textDocument").?.object.get("uri").?.string;
-            const pos = params.object.get("position").?;
-            const line: i64 = switch (pos.object.get("line").?) {
-                .integer => |n| n,
-                else => 0,
-            };
-            const character: i64 = switch (pos.object.get("character").?) {
-                .integer => |n| n,
-                else => 0,
-            };
-            const text = self.documents.get(uri) orelse {
-                try self.reply(id, &.{});
-                return;
-            };
-            const prefix = completionPrefix(text, @intCast(line), @intCast(character));
-            var items: std.ArrayListUnmanaged(CompletionItem) = .{};
-            defer items.deinit(self.allocator);
-
-            for (builtins) |b| {
-                if (prefix.len == 0 or std.mem.startsWith(u8, b.name, prefix)) {
-                    try items.append(self.allocator, .{
-                        .label = b.name,
-                        .kind = b.completionKind(),
-                        .detail = b.signature,
-                        .documentation = b.doc,
-                    });
-                }
-            }
-            try appendLocalCompletions(self.allocator, &items, text, prefix);
-
-            // Manual JSON: CompletionItem with optional fields
-            var result_buf: std.ArrayListUnmanaged(u8) = .{};
-            defer result_buf.deinit(self.allocator);
-            try result_buf.append(self.allocator, '[');
-            for (items.items, 0..) |it, i| {
-                if (i > 0) try result_buf.append(self.allocator, ',');
-                try result_buf.appendSlice(self.allocator, "{\"label\":");
-                try std.json.stringify(it.label, .{}, result_buf.writer(self.allocator));
-                try result_buf.writer(self.allocator).print(",\"kind\":{d},\"detail\":", .{it.kind});
-                try std.json.stringify(it.detail, .{}, result_buf.writer(self.allocator));
-                try result_buf.appendSlice(self.allocator, ",\"documentation\":{\"kind\":\"markdown\",\"value\":");
-                try std.json.stringify(it.documentation, .{}, result_buf.writer(self.allocator));
-                try result_buf.appendSlice(self.allocator, "}}");
-            }
-            try result_buf.append(self.allocator, ']');
-
-            var msg: std.ArrayListUnmanaged(u8) = .{};
-            defer msg.deinit(self.allocator);
-            try msg.appendSlice(self.allocator, "{\"jsonrpc\":\"2.0\",\"result\":");
-            try msg.appendSlice(self.allocator, result_buf.items);
-            try msg.appendSlice(self.allocator, ",\"id\":");
-            if (id) |i| {
-                try std.json.stringify(i, .{}, msg.writer(self.allocator));
-            } else {
-                try msg.appendSlice(self.allocator, "null");
-            }
-            try msg.append(self.allocator, '}');
-            try self.writeRaw(msg.items);
+            try self.flushPendingBeforeQuery();
+            try self.handleCompletion(id, root.object.get("params").?);
+            return;
+        }
+        if (std.mem.eql(u8, method.string, "textDocument/references")) {
+            try self.flushPendingBeforeQuery();
+            try self.handleReferences(id, root.object.get("params").?);
+            return;
+        }
+        if (std.mem.eql(u8, method.string, "textDocument/signatureHelp")) {
+            try self.flushPendingBeforeQuery();
+            try self.handleSignatureHelp(id, root.object.get("params").?);
+            return;
+        }
+        if (std.mem.eql(u8, method.string, "textDocument/prepareRename")) {
+            try self.flushPendingBeforeQuery();
+            try self.handlePrepareRename(id, root.object.get("params").?);
+            return;
+        }
+        if (std.mem.eql(u8, method.string, "textDocument/rename")) {
+            try self.flushPendingBeforeQuery();
+            try self.handleRename(id, root.object.get("params").?);
+            return;
+        }
+        if (std.mem.eql(u8, method.string, "workspace/symbol")) {
+            try self.flushPendingBeforeQuery();
+            try self.handleWorkspaceSymbol(id, root.object.get("params").?);
             return;
         }
         if (std.mem.eql(u8, method.string, "textDocument/documentSymbol")) {
-            const params = root.object.get("params").?;
-            const uri = params.object.get("textDocument").?.object.get("uri").?.string;
-            const text = self.documents.get(uri) orelse {
-                try self.reply(id, &.{});
-                return;
-            };
-            const path = try uriToPath(self.allocator, uri);
-            defer self.allocator.free(path);
-            const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.jog-lsp-tmp", .{path});
-            defer self.allocator.free(tmp_path);
-            {
-                const f = try std.fs.cwd().createFile(tmp_path, .{});
-                defer f.close();
-                try f.writeAll(text);
-            }
-            defer std.fs.cwd().deleteFile(tmp_path) catch {};
-
-            var child = std.process.Child.init(&.{ self.jog, "symbols", "--json", tmp_path }, self.allocator);
-            child.stdout_behavior = .Pipe;
-            child.stderr_behavior = .Ignore;
-            try child.spawn();
-            const out = try child.stdout.?.readToEndAlloc(self.allocator, 2 * 1024 * 1024);
-            defer self.allocator.free(out);
-            _ = try child.wait();
-
-            var result_buf: std.ArrayListUnmanaged(u8) = .{};
-            defer result_buf.deinit(self.allocator);
-            try result_buf.append(self.allocator, '[');
-            var first = true;
-            var lines = std.mem.splitScalar(u8, out, '\n');
-            while (lines.next()) |line| {
-                if (line.len == 0) continue;
-                const obj = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
-                defer obj.deinit();
-                if (obj.value != .object) continue;
-                const name = if (obj.value.object.get("name")) |n| (if (n == .string) n.string else continue) else continue;
-                const kind_s = if (obj.value.object.get("kind")) |k| (if (k == .string) k.string else "function") else "function";
-                const line_n: i64 = if (obj.value.object.get("line")) |l| switch (l) {
-                    .integer => l.integer,
-                    else => 1,
-                } else 1;
-                const col_n: i64 = if (obj.value.object.get("column")) |c| switch (c) {
-                    .integer => c.integer,
-                    else => 1,
-                } else 1;
-                const kind: u8 = if (std.mem.eql(u8, kind_s, "function")) 12 else if (std.mem.eql(u8, kind_s, "struct")) 23 else if (std.mem.eql(u8, kind_s, "enum")) 10 else if (std.mem.eql(u8, kind_s, "interface")) 11 else if (std.mem.eql(u8, kind_s, "constant")) 14 else if (std.mem.eql(u8, kind_s, "type")) 26 else 13;
-                const zl: i64 = if (line_n > 0) line_n - 1 else 0;
-                const zc: i64 = if (col_n > 0) col_n - 1 else 0;
-                if (!first) try result_buf.append(self.allocator, ',');
-                first = false;
-                try result_buf.appendSlice(self.allocator, "{\"name\":");
-                try std.json.stringify(name, .{}, result_buf.writer(self.allocator));
-                try result_buf.writer(self.allocator).print(
-                    ",\"kind\":{d},\"range\":{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":{d}}}}},\"selectionRange\":{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":{d}}}}}",
-                    .{ kind, zl, zc, zl, zc + @as(i64, @intCast(name.len)), zl, zc, zl, zc + @as(i64, @intCast(name.len)) },
-                );
-                try result_buf.append(self.allocator, '}');
-            }
-            try result_buf.append(self.allocator, ']');
-
-            var msg: std.ArrayListUnmanaged(u8) = .{};
-            defer msg.deinit(self.allocator);
-            try msg.appendSlice(self.allocator, "{\"jsonrpc\":\"2.0\",\"result\":");
-            try msg.appendSlice(self.allocator, result_buf.items);
-            try msg.appendSlice(self.allocator, ",\"id\":");
-            if (id) |i| {
-                try std.json.stringify(i, .{}, msg.writer(self.allocator));
-            } else {
-                try msg.appendSlice(self.allocator, "null");
-            }
-            try msg.append(self.allocator, '}');
-            try self.writeRaw(msg.items);
+            try self.flushPendingBeforeQuery();
+            try self.handleDocumentSymbol(id, root.object.get("params").?);
             return;
         }
+    }
+
+    fn positionOf(params: std.json.Value) struct { line: u32, character: u32 } {
+        const pos = params.object.get("position").?;
+        const line: i64 = switch (pos.object.get("line").?) {
+            .integer => |n| n,
+            else => 0,
+        };
+        const character: i64 = switch (pos.object.get("character").?) {
+            .integer => |n| n,
+            else => 0,
+        };
+        return .{ .line = @intCast(line), .character = @intCast(character) };
+    }
+
+    fn handleHover(self: *Server, id: ?std.json.Value, params: std.json.Value) !void {
+        const uri = params.object.get("textDocument").?.object.get("uri").?.string;
+        const pos = positionOf(params);
+        const text = self.documents.get(uri) orelse {
+            try self.reply(id, null);
+            return;
+        };
+        if (try self.runIdeJson(uri, text, "hover", pos.line, pos.character)) |raw| {
+            defer self.allocator.free(raw);
+            if (parseIdeObject(self.allocator, raw)) |obj| {
+                defer obj.deinit();
+                if (jsonBool(obj.value, "ok")) {
+                    if (jsonString(obj.value, "contents")) |contents| {
+                        if (contents.len > 0) {
+                            const md = try std.fmt.allocPrint(self.allocator, "```jog\n{s}\n```", .{contents});
+                            defer self.allocator.free(md);
+                            try self.reply(id, .{
+                                .contents = .{ .kind = "markdown", .value = md },
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        // Builtins only when compiler has no source (intrinsics).
+        if (findSymbolAt(text, pos.line, pos.character)) |sym| {
+            if (lookupBuiltin(sym)) |b| {
+                const md = try std.fmt.allocPrint(
+                    self.allocator,
+                    "```jog\n{s}\n```\n\n{s}",
+                    .{ b.signature, b.doc },
+                );
+                defer self.allocator.free(md);
+                try self.reply(id, .{
+                    .contents = .{ .kind = "markdown", .value = md },
+                });
+                return;
+            }
+        }
+        try self.reply(id, null);
+    }
+
+    fn handleDefinition(self: *Server, id: ?std.json.Value, params: std.json.Value) !void {
+        const uri = params.object.get("textDocument").?.object.get("uri").?.string;
+        const pos = positionOf(params);
+        const text = self.documents.get(uri) orelse {
+            try self.reply(id, null);
+            return;
+        };
+        if (try self.runIdeJson(uri, text, "definition", pos.line, pos.character)) |raw| {
+            defer self.allocator.free(raw);
+            if (parseIdeObject(self.allocator, raw)) |obj| {
+                defer obj.deinit();
+                if (jsonBool(obj.value, "ok")) {
+                    if (jsonString(obj.value, "file")) |file| {
+                        const loc = try locationFromIde(self.allocator, obj.value, file);
+                        defer self.allocator.free(loc.uri);
+                        try self.reply(id, .{
+                            .uri = loc.uri,
+                            .range = loc.range,
+                        });
+                        return;
+                    }
+                }
+            }
+        }
+        // Builtins / unresolved: no source.
+        try self.reply(id, null);
+    }
+
+    fn handleCompletion(self: *Server, id: ?std.json.Value, params: std.json.Value) !void {
+        const uri = params.object.get("textDocument").?.object.get("uri").?.string;
+        const pos = positionOf(params);
+        const text = self.documents.get(uri) orelse {
+            try self.replyRawResult(id, "[]");
+            return;
+        };
+        var items: std.ArrayListUnmanaged(CompletionItem) = .{};
+        defer items.deinit(self.allocator);
+
+        const after_dot = textEndsWithDotContext(text, pos.line, pos.character);
+        if (try self.runIdeJson(uri, text, "complete", pos.line, pos.character)) |raw| {
+            defer self.allocator.free(raw);
+            if (parseIdeObject(self.allocator, raw)) |obj| {
+                defer obj.deinit();
+                if (obj.value.object.get("items")) |arr| {
+                    if (arr == .array) {
+                        for (arr.array.items) |it| {
+                            if (it != .object) continue;
+                            const label = if (it.object.get("label")) |l| (if (l == .string) l.string else continue) else continue;
+                            const kind_s = if (it.object.get("kind")) |k| (if (k == .string) k.string else "variable") else "variable";
+                            const detail = if (it.object.get("detail")) |d| (if (d == .string) d.string else "") else "";
+                            try items.append(self.allocator, .{
+                                .label = try self.allocator.dupe(u8, label),
+                                .kind = ideKindToCompletion(kind_s),
+                                .detail = try self.allocator.dupe(u8, detail),
+                                .documentation = try self.allocator.dupe(u8, ""),
+                                .owned = true,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Merge builtins unless member-completing after `.`.
+        if (!after_dot) {
+            const prefix = completionPrefix(text, pos.line, pos.character);
+            for (builtins) |b| {
+                if (prefix.len == 0 or std.mem.startsWith(u8, b.name, prefix)) {
+                    var dup = false;
+                    for (items.items) |it| {
+                        if (std.mem.eql(u8, it.label, b.name)) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        try items.append(self.allocator, .{
+                            .label = b.name,
+                            .kind = b.completionKind(),
+                            .detail = b.signature,
+                            .documentation = b.doc,
+                            .owned = false,
+                        });
+                    }
+                }
+            }
+        }
+
+        var result_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer result_buf.deinit(self.allocator);
+        try result_buf.append(self.allocator, '[');
+        for (items.items, 0..) |it, i| {
+            if (i > 0) try result_buf.append(self.allocator, ',');
+            try result_buf.appendSlice(self.allocator, "{\"label\":");
+            try std.json.stringify(it.label, .{}, result_buf.writer(self.allocator));
+            try result_buf.writer(self.allocator).print(",\"kind\":{d}", .{it.kind});
+            if (it.detail.len > 0) {
+                try result_buf.appendSlice(self.allocator, ",\"detail\":");
+                try std.json.stringify(it.detail, .{}, result_buf.writer(self.allocator));
+            }
+            if (it.documentation.len > 0) {
+                try result_buf.appendSlice(self.allocator, ",\"documentation\":{\"kind\":\"markdown\",\"value\":");
+                try std.json.stringify(it.documentation, .{}, result_buf.writer(self.allocator));
+                try result_buf.append(self.allocator, '}');
+            }
+            try result_buf.append(self.allocator, '}');
+            if (it.owned) {
+                self.allocator.free(it.label);
+                self.allocator.free(it.detail);
+                self.allocator.free(it.documentation);
+            }
+        }
+        try result_buf.append(self.allocator, ']');
+        try self.replyRawResult(id, result_buf.items);
+    }
+
+    fn handleReferences(self: *Server, id: ?std.json.Value, params: std.json.Value) !void {
+        const uri = params.object.get("textDocument").?.object.get("uri").?.string;
+        const pos = positionOf(params);
+        const text = self.documents.get(uri) orelse {
+            try self.replyRawResult(id, "[]");
+            return;
+        };
+        var result_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer result_buf.deinit(self.allocator);
+        try result_buf.append(self.allocator, '[');
+        var first = true;
+        if (try self.runIdeJson(uri, text, "references", pos.line, pos.character)) |raw| {
+            defer self.allocator.free(raw);
+            if (parseIdeObject(self.allocator, raw)) |obj| {
+                defer obj.deinit();
+                if (obj.value.object.get("refs")) |arr| {
+                    if (arr == .array) {
+                        for (arr.array.items) |r| {
+                            if (r != .object) continue;
+                            const file = jsonString(r, "file") orelse continue;
+                            const loc = try locationFromIde(self.allocator, r, file);
+                            defer self.allocator.free(loc.uri);
+                            if (!first) try result_buf.append(self.allocator, ',');
+                            first = false;
+                            try appendLocationJson(&result_buf, self.allocator, loc);
+                        }
+                    }
+                }
+            }
+        }
+        try result_buf.append(self.allocator, ']');
+        try self.replyRawResult(id, result_buf.items);
+    }
+
+    fn handleSignatureHelp(self: *Server, id: ?std.json.Value, params: std.json.Value) !void {
+        const uri = params.object.get("textDocument").?.object.get("uri").?.string;
+        const pos = positionOf(params);
+        const text = self.documents.get(uri) orelse {
+            try self.reply(id, null);
+            return;
+        };
+        // Walk back to the call name before `(` at/near the cursor.
+        const call_pos = findCallNamePosition(text, pos.line, pos.character) orelse {
+            try self.reply(id, null);
+            return;
+        };
+        if (try self.runIdeJson(uri, text, "hover", call_pos.line, call_pos.character)) |raw| {
+            defer self.allocator.free(raw);
+            if (parseIdeObject(self.allocator, raw)) |obj| {
+                defer obj.deinit();
+                if (jsonBool(obj.value, "ok")) {
+                    if (jsonString(obj.value, "contents")) |contents| {
+                        if (contents.len > 0 and (std.mem.startsWith(u8, contents, "fn ") or std.mem.indexOf(u8, contents, "(") != null)) {
+                            try self.reply(id, .{
+                                .signatures = .{
+                                    .{ .label = contents, .documentation = contents },
+                                },
+                                .activeSignature = 0,
+                                .activeParameter = 0,
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        if (findSymbolAt(text, call_pos.line, call_pos.character)) |sym| {
+            if (lookupBuiltin(sym)) |b| {
+                try self.reply(id, .{
+                    .signatures = .{
+                        .{ .label = b.signature, .documentation = b.doc },
+                    },
+                    .activeSignature = 0,
+                    .activeParameter = 0,
+                });
+                return;
+            }
+        }
+        try self.reply(id, null);
+    }
+
+    fn handlePrepareRename(self: *Server, id: ?std.json.Value, params: std.json.Value) !void {
+        const uri = params.object.get("textDocument").?.object.get("uri").?.string;
+        const pos = positionOf(params);
+        const text = self.documents.get(uri) orelse {
+            try self.reply(id, null);
+            return;
+        };
+        if (findSymbolAt(text, pos.line, pos.character)) |sym| {
+            if (lookupBuiltin(sym) != null) {
+                try self.reply(id, null);
+                return;
+            }
+            const range = symbolRangeAt(text, pos.line, pos.character, sym) orelse {
+                try self.reply(id, null);
+                return;
+            };
+            try self.reply(id, .{
+                .range = range,
+                .placeholder = sym,
+            });
+            return;
+        }
+        try self.reply(id, null);
+    }
+
+    fn handleRename(self: *Server, id: ?std.json.Value, params: std.json.Value) !void {
+        const uri = params.object.get("textDocument").?.object.get("uri").?.string;
+        const pos = positionOf(params);
+        const new_name = params.object.get("newName").?.string;
+        const text = self.documents.get(uri) orelse {
+            try self.reply(id, null);
+            return;
+        };
+        if (findSymbolAt(text, pos.line, pos.character)) |sym| {
+            if (lookupBuiltin(sym) != null) {
+                try self.reply(id, null);
+                return;
+            }
+        }
+
+        var result_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer result_buf.deinit(self.allocator);
+        try result_buf.appendSlice(self.allocator, "{\"changes\":{");
+
+        var file_edits: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(u8)) = .{};
+        defer {
+            var it = file_edits.iterator();
+            while (it.next()) |e| {
+                self.allocator.free(e.key_ptr.*);
+                e.value_ptr.deinit(self.allocator);
+            }
+            file_edits.deinit(self.allocator);
+        }
+
+        if (try self.runIdeJson(uri, text, "references", pos.line, pos.character)) |raw| {
+            defer self.allocator.free(raw);
+            if (parseIdeObject(self.allocator, raw)) |obj| {
+                defer obj.deinit();
+                if (obj.value.object.get("refs")) |arr| {
+                    if (arr == .array) {
+                        for (arr.array.items) |r| {
+                            if (r != .object) continue;
+                            const file = jsonString(r, "file") orelse continue;
+                            const loc = try locationFromIde(self.allocator, r, file);
+                            defer self.allocator.free(loc.uri);
+
+                            const gop = try file_edits.getOrPut(self.allocator, loc.uri);
+                            if (!gop.found_existing) {
+                                gop.key_ptr.* = try self.allocator.dupe(u8, loc.uri);
+                                gop.value_ptr.* = .{};
+                            }
+                            var list = gop.value_ptr;
+                            if (list.items.len > 0) try list.append(self.allocator, ',');
+                            try list.appendSlice(self.allocator, "{\"range\":");
+                            try appendRangeJson(list, self.allocator, loc.range);
+                            try list.appendSlice(self.allocator, ",\"newText\":");
+                            try std.json.stringify(new_name, .{}, list.writer(self.allocator));
+                            try list.append(self.allocator, '}');
+                        }
+                    }
+                }
+            }
+        }
+
+        var first_file = true;
+        var it = file_edits.iterator();
+        while (it.next()) |e| {
+            if (!first_file) try result_buf.append(self.allocator, ',');
+            first_file = false;
+            try std.json.stringify(e.key_ptr.*, .{}, result_buf.writer(self.allocator));
+            try result_buf.appendSlice(self.allocator, ":[");
+            try result_buf.appendSlice(self.allocator, e.value_ptr.items);
+            try result_buf.append(self.allocator, ']');
+        }
+        try result_buf.appendSlice(self.allocator, "}}");
+        try self.replyRawResult(id, result_buf.items);
+    }
+
+    fn handleWorkspaceSymbol(self: *Server, id: ?std.json.Value, params: std.json.Value) !void {
+        const query = if (params.object.get("query")) |q| (if (q == .string) q.string else "") else "";
+
+        var result_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer result_buf.deinit(self.allocator);
+        try result_buf.append(self.allocator, '[');
+        var first = true;
+        var seen: std.StringHashMapUnmanaged(void) = .{};
+        defer seen.deinit(self.allocator);
+
+        // Try every open buffer whose path is still writable (skip deleted smoke temps).
+        var doc_it = self.documents.iterator();
+        while (doc_it.next()) |e| {
+            const uri = e.key_ptr.*;
+            const text = e.value_ptr.*;
+            const path = try uriToPath(self.allocator, uri);
+            defer self.allocator.free(path);
+            const dir = std.fs.path.dirname(path) orelse continue;
+            std.fs.cwd().access(dir, .{}) catch continue;
+
+            if (try self.runIdeRaw(uri, text, "symbols", 1, 1)) |raw| {
+                defer self.allocator.free(raw);
+                var lines = std.mem.splitScalar(u8, raw, '\n');
+                while (lines.next()) |line| {
+                    if (line.len == 0) continue;
+                    const obj = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
+                    defer obj.deinit();
+                    if (obj.value != .object) continue;
+                    const name = jsonString(obj.value, "name") orelse continue;
+                    if (query.len > 0 and std.mem.indexOf(u8, name, query) == null) continue;
+                    const file = jsonString(obj.value, "file") orelse continue;
+                    const key = try std.fmt.allocPrint(self.allocator, "{s}\x00{s}:{d}", .{ file, name, jsonInt(obj.value, "line", 1) });
+                    defer self.allocator.free(key);
+                    if (seen.contains(key)) continue;
+                    try seen.put(self.allocator, try self.allocator.dupe(u8, key), {});
+                    const kind_s = jsonString(obj.value, "kind") orelse "function";
+                    const loc = try locationFromIde(self.allocator, obj.value, file);
+                    defer self.allocator.free(loc.uri);
+                    if (!first) try result_buf.append(self.allocator, ',');
+                    first = false;
+                    try result_buf.appendSlice(self.allocator, "{\"name\":");
+                    try std.json.stringify(name, .{}, result_buf.writer(self.allocator));
+                    try result_buf.writer(self.allocator).print(",\"kind\":{d},\"location\":", .{ideKindToSymbol(kind_s)});
+                    try appendLocationJson(&result_buf, self.allocator, loc);
+                    try result_buf.append(self.allocator, '}');
+                }
+            }
+        }
+
+        // Free seen keys.
+        var sit = seen.iterator();
+        while (sit.next()) |e| self.allocator.free(e.key_ptr.*);
+
+        try result_buf.append(self.allocator, ']');
+        try self.replyRawResult(id, result_buf.items);
+    }
+
+    fn handleDocumentSymbol(self: *Server, id: ?std.json.Value, params: std.json.Value) !void {
+        const uri = params.object.get("textDocument").?.object.get("uri").?.string;
+        const text = self.documents.get(uri) orelse {
+            try self.replyRawResult(id, "[]");
+            return;
+        };
+        const path = try uriToPath(self.allocator, uri);
+        defer self.allocator.free(path);
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.jog-lsp-tmp", .{path});
+        defer self.allocator.free(tmp_path);
+        {
+            const f = try std.fs.cwd().createFile(tmp_path, .{});
+            defer f.close();
+            try f.writeAll(text);
+        }
+        defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+        var child = std.process.Child.init(&.{ self.jog, "symbols", "--json", tmp_path }, self.allocator);
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+        try child.spawn();
+        const out = try child.stdout.?.readToEndAlloc(self.allocator, 2 * 1024 * 1024);
+        defer self.allocator.free(out);
+        _ = try child.wait();
+
+        var result_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer result_buf.deinit(self.allocator);
+        try result_buf.append(self.allocator, '[');
+        var first = true;
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            const obj = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
+            defer obj.deinit();
+            if (obj.value != .object) continue;
+            const name = jsonString(obj.value, "name") orelse continue;
+            const kind_s = jsonString(obj.value, "kind") orelse "function";
+            const line_n = jsonInt(obj.value, "line", 1);
+            const col_n = jsonInt(obj.value, "column", 1);
+            const end_line = jsonInt(obj.value, "end_line", line_n);
+            const end_col = jsonInt(obj.value, "end_column", col_n + @as(i64, @intCast(name.len)));
+            const kind = ideKindToSymbol(kind_s);
+            const zl: i64 = if (line_n > 0) line_n - 1 else 0;
+            const zc: i64 = if (col_n > 0) col_n - 1 else 0;
+            const zel: i64 = if (end_line > 0) end_line - 1 else zl;
+            const zec: i64 = if (end_col > 0) end_col - 1 else zc + @as(i64, @intCast(name.len));
+            if (!first) try result_buf.append(self.allocator, ',');
+            first = false;
+            try result_buf.appendSlice(self.allocator, "{\"name\":");
+            try std.json.stringify(name, .{}, result_buf.writer(self.allocator));
+            try result_buf.writer(self.allocator).print(
+                ",\"kind\":{d},\"range\":{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":{d}}}}},\"selectionRange\":{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":{d}}}}}",
+                .{ kind, zl, zc, zel, zec, zl, zc, zel, zec },
+            );
+            try result_buf.append(self.allocator, '}');
+        }
+        try result_buf.append(self.allocator, ']');
+        try self.replyRawResult(id, result_buf.items);
     }
 
     fn setDoc(self: *Server, uri: []const u8, text: []const u8) !void {
@@ -422,14 +764,83 @@ const Server = struct {
         }
     }
 
+    /// Run `jog ide <mode> …` against a `.jog-lsp-tmp` buffer. Returns owned stdout (trimmed).
+    fn runIdeJson(self: *Server, uri: []const u8, text: []const u8, mode: []const u8, zero_line: u32, zero_character: u32) !?[]u8 {
+        return self.runIdeRaw(uri, text, mode, zero_line + 1, zero_character + 1);
+    }
+
+    fn runIdeRaw(self: *Server, uri: []const u8, text: []const u8, mode: []const u8, one_line: u32, one_column: u32) !?[]u8 {
+        const path = try uriToPath(self.allocator, uri);
+        defer self.allocator.free(path);
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.jog-lsp-tmp", .{path});
+        defer self.allocator.free(tmp_path);
+        {
+            const f = std.fs.cwd().createFile(tmp_path, .{}) catch return null;
+            defer f.close();
+            f.writeAll(text) catch return null;
+        }
+        defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+        var argv: std.ArrayListUnmanaged([]const u8) = .{};
+        defer argv.deinit(self.allocator);
+        try argv.append(self.allocator, self.jog);
+        try argv.append(self.allocator, "ide");
+        try argv.append(self.allocator, mode);
+        const line_s = try std.fmt.allocPrint(self.allocator, "{d}", .{one_line});
+        defer self.allocator.free(line_s);
+        const col_s = try std.fmt.allocPrint(self.allocator, "{d}", .{one_column});
+        defer self.allocator.free(col_s);
+        try argv.append(self.allocator, "--line");
+        try argv.append(self.allocator, line_s);
+        try argv.append(self.allocator, "--column");
+        try argv.append(self.allocator, col_s);
+        if (std.mem.endsWith(u8, path, ".test.jog")) {
+            try argv.append(self.allocator, "--test");
+        }
+        var flag_storage: std.ArrayListUnmanaged([]u8) = .{};
+        defer {
+            for (flag_storage.items) |s| self.allocator.free(s);
+            flag_storage.deinit(self.allocator);
+        }
+        if (try moduleRootOf(self.allocator, path)) |mod_root| {
+            defer self.allocator.free(mod_root);
+            if (try fetchModuleFlags(self.allocator, self.jog, mod_root, std.mem.endsWith(u8, path, ".test.jog"))) |flags| {
+                defer {
+                    for (flags) |f| self.allocator.free(f);
+                    self.allocator.free(flags);
+                }
+                for (flags) |f| {
+                    const owned = try self.allocator.dupe(u8, f);
+                    try flag_storage.append(self.allocator, owned);
+                    try argv.append(self.allocator, owned);
+                }
+            }
+        }
+        try argv.append(self.allocator, tmp_path);
+
+        var child = std.process.Child.init(argv.items, self.allocator);
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+        child.spawn() catch return null;
+        const out = child.stdout.?.readToEndAlloc(self.allocator, 4 * 1024 * 1024) catch {
+            _ = child.wait() catch {};
+            return null;
+        };
+        _ = child.wait() catch {};
+        const trimmed = std.mem.trim(u8, out, " \t\r\n");
+        if (trimmed.len == 0) {
+            self.allocator.free(out);
+            return null;
+        }
+        // Return owned slice of full buffer (caller frees). Keep original alloc.
+        return out;
+    }
+
     fn publishDiags(self: *Server, uri: []const u8) !void {
         const text = self.documents.get(uri) orelse return;
         const path = try uriToPath(self.allocator, uri);
         defer self.allocator.free(path);
 
-        // Write buffer to a temp file so unsaved edits are checked.
-        // Contract: `jog check --diag=json [--module=…] [--test] <path>` —
-        // JSON lines on stdout (`file`,`line`,`column`,`severity`,`message`).
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.jog-lsp-tmp", .{path});
         defer self.allocator.free(tmp_path);
         {
@@ -447,15 +858,14 @@ const Server = struct {
         if (std.mem.endsWith(u8, path, ".test.jog")) {
             try argv.append(self.allocator, "--test");
         }
-        // Path requires from nearest jog.mod → `--module=name=dir`.
         var flag_storage: std.ArrayListUnmanaged([]u8) = .{};
         defer {
             for (flag_storage.items) |s| self.allocator.free(s);
             flag_storage.deinit(self.allocator);
         }
-        if (try moduleRootOf(self.allocator, path)) |root| {
-            defer self.allocator.free(root);
-            if (try fetchModuleFlags(self.allocator, self.jog, root, std.mem.endsWith(u8, path, ".test.jog"))) |flags| {
+        if (try moduleRootOf(self.allocator, path)) |mod_root| {
+            defer self.allocator.free(mod_root);
+            if (try fetchModuleFlags(self.allocator, self.jog, mod_root, std.mem.endsWith(u8, path, ".test.jog"))) |flags| {
                 defer {
                     for (flags) |f| self.allocator.free(f);
                     self.allocator.free(flags);
@@ -488,33 +898,36 @@ const Server = struct {
             const obj = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
             defer obj.deinit();
             if (obj.value != .object) continue;
-            const msg = if (obj.value.object.get("message")) |m| (if (m == .string) m.string else "error") else "error";
-            const line_n: i64 = if (obj.value.object.get("line")) |l| switch (l) {
-                .integer => l.integer,
-                else => 1,
-            } else 1;
-            const col_n: i64 = if (obj.value.object.get("column")) |c| switch (c) {
-                .integer => c.integer,
-                else => 1,
-            } else 1;
-            const zero_line: i64 = if (line_n > 0) line_n - 1 else 0;
-            const zero_col: i64 = if (col_n > 0) col_n - 1 else 0;
+            const msg = jsonString(obj.value, "message") orelse "error";
+            const sev_s = jsonString(obj.value, "severity") orelse "error";
+            const line_n = jsonInt(obj.value, "line", 1);
+            const col_n = jsonInt(obj.value, "column", 1);
+            const end_line_n = jsonInt(obj.value, "end_line", 0);
+            const end_col_n = jsonInt(obj.value, "end_column", 0);
+            const zero_line: u32 = @intCast(if (line_n > 0) line_n - 1 else 0);
+            const zero_col: u32 = @intCast(if (col_n > 0) col_n - 1 else 0);
+            const zero_end_line: u32 = if (end_line_n > 0) @intCast(end_line_n - 1) else zero_line;
+            const zero_end_col: u32 = if (end_col_n > 0) @intCast(end_col_n - 1) else zero_col + 1;
             try diags.append(self.allocator, .{
                 .message = try self.allocator.dupe(u8, msg),
-                .line = @intCast(zero_line),
-                .character = @intCast(zero_col),
+                .line = zero_line,
+                .character = zero_col,
+                .end_line = zero_end_line,
+                .end_character = zero_end_col,
+                .severity = severityToLsp(sev_s),
             });
         }
-        // Also surface stderr parse chatter if no JSON lines
         if (diags.items.len == 0 and err.len > 0) {
             try diags.append(self.allocator, .{
                 .message = try self.allocator.dupe(u8, std.mem.trim(u8, err, " \n\r\t")),
                 .line = 0,
                 .character = 0,
+                .end_line = 0,
+                .end_character = 1,
+                .severity = 1,
             });
         }
 
-        // Build JSON manually for diagnostics array
         var payload: std.ArrayListUnmanaged(u8) = .{};
         defer payload.deinit(self.allocator);
         try payload.appendSlice(self.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":");
@@ -526,11 +939,14 @@ const Server = struct {
             try params_buf.appendSlice(self.allocator, ",\"diagnostics\":[");
             for (diags.items, 0..) |d, i| {
                 if (i > 0) try params_buf.append(self.allocator, ',');
-                try params_buf.appendSlice(self.allocator, "{\"severity\":1,\"message\":");
+                try params_buf.writer(self.allocator).print(
+                    "{{\"severity\":{d},\"message\":",
+                    .{d.severity},
+                );
                 try std.json.stringify(d.message, .{}, params_buf.writer(self.allocator));
                 try params_buf.writer(self.allocator).print(
                     ",\"range\":{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":{d}}}}}",
-                    .{ d.line, d.character, d.line, d.character + 1 },
+                    .{ d.line, d.character, d.end_line, d.end_character },
                 );
                 try params_buf.append(self.allocator, '}');
                 self.allocator.free(d.message);
@@ -557,6 +973,21 @@ const Server = struct {
         try self.writeRaw(buf.items);
     }
 
+    fn replyRawResult(self: *Server, id: ?std.json.Value, result_json: []const u8) !void {
+        var msg: std.ArrayListUnmanaged(u8) = .{};
+        defer msg.deinit(self.allocator);
+        try msg.appendSlice(self.allocator, "{\"jsonrpc\":\"2.0\",\"result\":");
+        try msg.appendSlice(self.allocator, result_json);
+        try msg.appendSlice(self.allocator, ",\"id\":");
+        if (id) |i| {
+            try std.json.stringify(i, .{}, msg.writer(self.allocator));
+        } else {
+            try msg.appendSlice(self.allocator, "null");
+        }
+        try msg.append(self.allocator, '}');
+        try self.writeRaw(msg.items);
+    }
+
     fn writeRaw(self: *Server, body: []const u8) !void {
         var header_buf: [64]u8 = undefined;
         const header = try std.fmt.bufPrint(&header_buf, "Content-Length: {d}\r\n\r\n", .{body.len});
@@ -565,19 +996,41 @@ const Server = struct {
     }
 };
 
+fn pollReadable(fd: std.posix.fd_t, timeout_ms: i32) !bool {
+    var pfd = [_]std.posix.pollfd{.{
+        .fd = fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const n = std.posix.poll(&pfd, timeout_ms) catch return true;
+    return n > 0 and (pfd[0].revents & std.posix.POLL.IN) != 0;
+}
+
 const Diag = struct {
     message: []u8,
     line: u32,
     character: u32,
+    end_line: u32,
+    end_character: u32,
+    severity: u8,
 };
-
-const DeclLoc = struct { line: u32, character: u32 };
 
 const CompletionItem = struct {
     label: []const u8,
     kind: u8,
     detail: []const u8,
     documentation: []const u8,
+    owned: bool = false,
+};
+
+const LspRange = struct {
+    start: struct { line: u32, character: u32 },
+    end: struct { line: u32, character: u32 },
+};
+
+const LspLocation = struct {
+    uri: []u8,
+    range: LspRange,
 };
 
 const BuiltinKind = enum { fn_builtin, type_builtin, keyword };
@@ -590,14 +1043,13 @@ const Builtin = struct {
 
     fn completionKind(self: Builtin) u8 {
         return switch (self.kind) {
-            .fn_builtin => 3, // Function
-            .type_builtin => 25, // TypeParameter / Class-ish
-            .keyword => 14, // Keyword
+            .fn_builtin => 3,
+            .type_builtin => 25,
+            .keyword => 14,
         };
     }
 };
 
-/// Language + runtime surface present in JogCompiler v2 after Gates 1–4 + Chase-Lev.
 const builtins = [_]Builtin{
     .{ .name = "go", .kind = .fn_builtin, .signature = "fn go(entry: fn(*byte), arg: *byte)", .doc = "Enqueue a stackful coroutine on the current Dispatcher pool." },
     .{ .name = "yield", .kind = .fn_builtin, .signature = "fn yield()", .doc = "Cooperatively yield to another ready coroutine on this worker." },
@@ -629,6 +1081,107 @@ fn lookupBuiltin(name: []const u8) ?Builtin {
     return null;
 }
 
+fn severityToLsp(s: []const u8) u8 {
+    if (std.mem.eql(u8, s, "error")) return 1;
+    if (std.mem.eql(u8, s, "warning")) return 2;
+    if (std.mem.eql(u8, s, "info")) return 3;
+    if (std.mem.eql(u8, s, "hint")) return 4;
+    return 1;
+}
+
+fn ideKindToCompletion(kind: []const u8) u8 {
+    if (std.mem.eql(u8, kind, "function")) return 3;
+    if (std.mem.eql(u8, kind, "method")) return 2;
+    if (std.mem.eql(u8, kind, "field")) return 5;
+    if (std.mem.eql(u8, kind, "variable")) return 6;
+    if (std.mem.eql(u8, kind, "constant")) return 21;
+    if (std.mem.eql(u8, kind, "struct") or std.mem.eql(u8, kind, "object")) return 22;
+    if (std.mem.eql(u8, kind, "enum")) return 13;
+    if (std.mem.eql(u8, kind, "interface") or std.mem.eql(u8, kind, "type")) return 25;
+    return 6;
+}
+
+fn ideKindToSymbol(kind: []const u8) u8 {
+    if (std.mem.eql(u8, kind, "function") or std.mem.eql(u8, kind, "method")) return 12;
+    if (std.mem.eql(u8, kind, "struct") or std.mem.eql(u8, kind, "object")) return 23;
+    if (std.mem.eql(u8, kind, "enum")) return 10;
+    if (std.mem.eql(u8, kind, "interface")) return 11;
+    if (std.mem.eql(u8, kind, "constant")) return 14;
+    if (std.mem.eql(u8, kind, "type")) return 26;
+    if (std.mem.eql(u8, kind, "field")) return 8;
+    return 13;
+}
+
+fn parseIdeObject(allocator: std.mem.Allocator, raw: []const u8) ?std.json.Parsed(std.json.Value) {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    // First JSON object line.
+    const line = blk: {
+        if (std.mem.indexOfScalar(u8, trimmed, '\n')) |nl| break :blk trimmed[0..nl];
+        break :blk trimmed;
+    };
+    return std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch null;
+}
+
+fn jsonBool(v: std.json.Value, key: []const u8) bool {
+    if (v != .object) return false;
+    const x = v.object.get(key) orelse return false;
+    return switch (x) {
+        .bool => |b| b,
+        else => false,
+    };
+}
+
+fn jsonString(v: std.json.Value, key: []const u8) ?[]const u8 {
+    if (v != .object) return null;
+    const x = v.object.get(key) orelse return null;
+    return if (x == .string) x.string else null;
+}
+
+fn jsonInt(v: std.json.Value, key: []const u8, default: i64) i64 {
+    if (v != .object) return default;
+    const x = v.object.get(key) orelse return default;
+    return switch (x) {
+        .integer => |n| n,
+        else => default,
+    };
+}
+
+fn locationFromIde(allocator: std.mem.Allocator, v: std.json.Value, file: []const u8) !LspLocation {
+    const line_n = jsonInt(v, "line", 1);
+    const col_n = jsonInt(v, "column", 1);
+    const end_line_n = jsonInt(v, "end_line", line_n);
+    const end_col_n = jsonInt(v, "end_column", col_n + 1);
+    const uri = try pathToFileUri(allocator, file);
+    return .{
+        .uri = uri,
+        .range = .{
+            .start = .{
+                .line = @intCast(if (line_n > 0) line_n - 1 else 0),
+                .character = @intCast(if (col_n > 0) col_n - 1 else 0),
+            },
+            .end = .{
+                .line = @intCast(if (end_line_n > 0) end_line_n - 1 else 0),
+                .character = @intCast(if (end_col_n > 0) end_col_n - 1 else 0),
+            },
+        },
+    };
+}
+
+fn appendRangeJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, range: LspRange) !void {
+    try buf.writer(allocator).print(
+        "{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":{d}}}}}",
+        .{ range.start.line, range.start.character, range.end.line, range.end.character },
+    );
+}
+
+fn appendLocationJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, loc: LspLocation) !void {
+    try buf.appendSlice(allocator, "{\"uri\":");
+    try std.json.stringify(loc.uri, .{}, buf.writer(allocator));
+    try buf.appendSlice(allocator, ",\"range\":");
+    try appendRangeJson(buf, allocator, loc.range);
+    try buf.append(allocator, '}');
+}
+
 fn isIdentChar(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
 }
@@ -654,6 +1207,31 @@ fn findSymbolAt(text: []const u8, line: u32, character: u32) ?[]const u8 {
     return null;
 }
 
+fn symbolRangeAt(text: []const u8, line: u32, character: u32, sym: []const u8) ?LspRange {
+    _ = sym;
+    var line_i: u32 = 0;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (line_i == line) {
+            const line_start = i;
+            while (i < text.len and text[i] != '\n') : (i += 1) {}
+            const line_text = text[line_start..i];
+            if (character >= line_text.len) return null;
+            var start = character;
+            while (start > 0 and isIdentChar(line_text[start - 1])) : (start -= 1) {}
+            var end = character;
+            while (end < line_text.len and isIdentChar(line_text[end])) : (end += 1) {}
+            if (start == end) return null;
+            return .{
+                .start = .{ .line = line, .character = @intCast(start) },
+                .end = .{ .line = line, .character = @intCast(end) },
+            };
+        }
+        if (text[i] == '\n') line_i += 1;
+    }
+    return null;
+}
+
 fn completionPrefix(text: []const u8, line: u32, character: u32) []const u8 {
     var line_i: u32 = 0;
     var i: usize = 0;
@@ -672,117 +1250,51 @@ fn completionPrefix(text: []const u8, line: u32, character: u32) []const u8 {
     return "";
 }
 
-fn findDeclLine(text: []const u8, name: []const u8) ?[]const u8 {
-    var line_start: usize = 0;
-    var i: usize = 0;
-    while (i <= text.len) : (i += 1) {
-        if (i == text.len or text[i] == '\n') {
-            const line = text[line_start..i];
-            if (lineContainsDecl(line, name)) {
-                return std.mem.trim(u8, line, " \t\r");
-            }
-            line_start = i + 1;
-        }
-    }
-    return null;
-}
-
-fn findDeclLocation(text: []const u8, name: []const u8) ?DeclLoc {
+fn textEndsWithDotContext(text: []const u8, line: u32, character: u32) bool {
     var line_i: u32 = 0;
-    var line_start: usize = 0;
     var i: usize = 0;
-    while (i <= text.len) : (i += 1) {
-        if (i == text.len or text[i] == '\n') {
-            const line = text[line_start..i];
-            if (lineContainsDecl(line, name)) {
-                if (std.mem.indexOf(u8, line, name)) |col| {
-                    return .{ .line = line_i, .character = @intCast(col) };
-                }
-            }
-            line_start = i + 1;
-            line_i += 1;
+    while (i < text.len) : (i += 1) {
+        if (line_i == line) {
+            const line_start = i;
+            while (i < text.len and text[i] != '\n') : (i += 1) {}
+            const line_text = text[line_start..i];
+            const col: usize = @min(character, line_text.len);
+            var pos = col;
+            while (pos > 0 and isIdentChar(line_text[pos - 1])) : (pos -= 1) {}
+            return pos > 0 and line_text[pos - 1] == '.';
         }
-    }
-    return null;
-}
-
-fn lineContainsDecl(line: []const u8, name: []const u8) bool {
-    const trimmed = std.mem.trim(u8, line, " \t");
-    const prefixes = [_][]const u8{ "fn ", "struct ", "type ", "interface ", "val ", "var " };
-    for (prefixes) |p| {
-        if (std.mem.startsWith(u8, trimmed, p)) {
-            const rest = trimmed[p.len..];
-            var r = rest;
-            if (r.len > 0 and r[0] == '*') r = r[1..];
-            if (std.mem.startsWith(u8, r, name)) {
-                const after = r[name.len..];
-                if (after.len == 0 or !isIdentChar(after[0])) return true;
-            }
-            if (std.mem.indexOfScalar(u8, r, '.')) |dot| {
-                const after_dot = r[dot + 1 ..];
-                if (std.mem.startsWith(u8, after_dot, name)) {
-                    const after = after_dot[name.len..];
-                    if (after.len == 0 or !isIdentChar(after[0])) return true;
-                }
-            }
-        }
+        if (text[i] == '\n') line_i += 1;
     }
     return false;
 }
 
-fn appendLocalCompletions(
-    allocator: std.mem.Allocator,
-    items: *std.ArrayListUnmanaged(CompletionItem),
-    text: []const u8,
-    prefix: []const u8,
-) !void {
-    var line_start: usize = 0;
+fn findCallNamePosition(text: []const u8, line: u32, character: u32) ?struct { line: u32, character: u32 } {
+    var line_i: u32 = 0;
     var i: usize = 0;
-    while (i <= text.len) : (i += 1) {
-        if (i == text.len or text[i] == '\n') {
-            const line = std.mem.trim(u8, text[line_start..i], " \t\r");
-            if (extractDeclName(line)) |name| {
-                if (prefix.len == 0 or std.mem.startsWith(u8, name, prefix)) {
-                    // Skip if already offered as a builtin
-                    if (lookupBuiltin(name) == null) {
-                        var dup = false;
-                        for (items.items) |it| {
-                            if (std.mem.eql(u8, it.label, name)) {
-                                dup = true;
-                                break;
-                            }
-                        }
-                        if (!dup) {
-                            try items.append(allocator, .{
-                                .label = name,
-                                .kind = 3,
-                                .detail = line,
-                                .documentation = "Local declaration",
-                            });
-                        }
-                    }
+    while (i < text.len) : (i += 1) {
+        if (line_i == line) {
+            const line_start = i;
+            while (i < text.len and text[i] != '\n') : (i += 1) {}
+            const line_text = text[line_start..i];
+            const col: usize = @min(character, line_text.len);
+            // Walk back to `(`, then to the ident before it.
+            var pos = col;
+            while (pos > 0 and line_text[pos - 1] != '(') : (pos -= 1) {}
+            if (pos == 0 or line_text[pos - 1] != '(') {
+                // Maybe sitting on the name before `(` — use symbol at cursor.
+                if (findSymbolAt(text, line, character) != null) {
+                    return .{ .line = line, .character = character };
                 }
+                return null;
             }
-            line_start = i + 1;
+            var name_end = pos - 1;
+            while (name_end > 0 and (line_text[name_end - 1] == ' ' or line_text[name_end - 1] == '\t')) : (name_end -= 1) {}
+            var name_start = name_end;
+            while (name_start > 0 and isIdentChar(line_text[name_start - 1])) : (name_start -= 1) {}
+            if (name_start >= name_end) return null;
+            return .{ .line = line, .character = @intCast(name_start) };
         }
-    }
-}
-
-fn extractDeclName(line: []const u8) ?[]const u8 {
-    const prefixes = [_][]const u8{ "fn ", "struct ", "type ", "interface ", "val ", "var " };
-    for (prefixes) |p| {
-        if (std.mem.startsWith(u8, line, p)) {
-            var r = line[p.len..];
-            if (r.len > 0 and r[0] == '*') r = r[1..];
-            // skip Type. for methods — return method name
-            if (std.mem.indexOfScalar(u8, r, '.')) |dot| {
-                r = r[dot + 1 ..];
-            }
-            var end: usize = 0;
-            while (end < r.len and isIdentChar(r[end])) : (end += 1) {}
-            if (end == 0) return null;
-            return r[0..end];
-        }
+        if (text[i] == '\n') line_i += 1;
     }
     return null;
 }
@@ -813,7 +1325,6 @@ fn moduleRootOf(allocator: std.mem.Allocator, file_path: []const u8) !?[]u8 {
     }
 }
 
-/// Run `jog deps --flags [--test]` in the module root; returns owned `--module=…` lines.
 fn fetchModuleFlags(allocator: std.mem.Allocator, jog: []const u8, root: []const u8, include_test: bool) !?[][]u8 {
     var argv: std.ArrayListUnmanaged([]const u8) = .{};
     defer argv.deinit(allocator);
@@ -851,168 +1362,10 @@ fn fetchModuleFlags(allocator: std.mem.Allocator, jog: []const u8, root: []const
     return try list.toOwnedSlice(allocator);
 }
 
-const LibDeclLine = struct {
-    path: []u8,
-    line: []u8,
-};
-
-const LibDeclLoc = struct {
-    path: []u8,
-    line: u32,
-    character: u32,
-};
-
 fn pathToFileUri(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const abs = std.fs.cwd().realpathAlloc(allocator, path) catch try allocator.dupe(u8, path);
     defer allocator.free(abs);
     return try std.fmt.allocPrint(allocator, "file://{s}", .{abs});
-}
-
-const LibRoots = struct {
-    std_root: []u8,
-    core_root: []u8,
-};
-
-fn emptyLibRoots(allocator: std.mem.Allocator) !LibRoots {
-    return .{
-        .std_root = try allocator.dupe(u8, ""),
-        .core_root = try allocator.dupe(u8, ""),
-    };
-}
-
-fn locateLibRoots(allocator: std.mem.Allocator, jog: []const u8) !LibRoots {
-    if (std.posix.getenv("JOG_ROOT")) |env| {
-        if (env.len > 0) {
-            const std_p = try std.fs.path.join(allocator, &.{ env, "std" });
-            const core_p = try std.fs.path.join(allocator, &.{ env, "core" });
-            if (fileExists(std_p) or fileExists(core_p)) {
-                return .{ .std_root = std_p, .core_root = core_p };
-            }
-            allocator.free(std_p);
-            allocator.free(core_p);
-        }
-    }
-    var child = std.process.Child.init(&.{ jog, "roots" }, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return try emptyLibRoots(allocator);
-    const out = child.stdout.?.readToEndAlloc(allocator, 64 * 1024) catch {
-        _ = child.wait() catch {};
-        return try emptyLibRoots(allocator);
-    };
-    defer allocator.free(out);
-    _ = child.wait() catch {};
-
-    var std_root: ?[]u8 = null;
-    var core_root: ?[]u8 = null;
-    var lines = std.mem.splitScalar(u8, out, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
-        if (std.mem.startsWith(u8, line, "std: ") and !std.mem.eql(u8, line["std: ".len..], "(missing)")) {
-            std_root = try allocator.dupe(u8, line["std: ".len..]);
-        } else if (std.mem.startsWith(u8, line, "core: ") and !std.mem.eql(u8, line["core: ".len..], "(missing)")) {
-            core_root = try allocator.dupe(u8, line["core: ".len..]);
-        }
-    }
-    return .{
-        .std_root = std_root orelse try allocator.dupe(u8, ""),
-        .core_root = core_root orelse try allocator.dupe(u8, ""),
-    };
-}
-
-fn appendImportFiles(
-    allocator: std.mem.Allocator,
-    list: *std.ArrayListUnmanaged([]u8),
-    std_root: []const u8,
-    text: []const u8,
-) !void {
-    if (std_root.len == 0) return;
-    var line_start: usize = 0;
-    var i: usize = 0;
-    while (i <= text.len) : (i += 1) {
-        if (i == text.len or text[i] == '\n') {
-            const line = std.mem.trim(u8, text[line_start..i], " \t\r");
-            if (std.mem.startsWith(u8, line, "import std.")) {
-                const rest = line["import std.".len..];
-                var end: usize = 0;
-                while (end < rest.len and isIdentChar(rest[end])) : (end += 1) {}
-                if (end > 0) {
-                    const pkg = rest[0..end];
-                    const file = try std.fmt.allocPrint(allocator, "{s}.jog", .{pkg});
-                    defer allocator.free(file);
-                    const path = try std.fs.path.join(allocator, &.{ std_root, pkg, file });
-                    if (fileExists(path)) {
-                        try list.append(allocator, path);
-                    } else {
-                        allocator.free(path);
-                    }
-                }
-            }
-            line_start = i + 1;
-        }
-    }
-}
-
-fn collectLibraryFiles(allocator: std.mem.Allocator, jog: []const u8, text: []const u8) ![][]u8 {
-    const roots = try locateLibRoots(allocator, jog);
-    defer {
-        allocator.free(roots.std_root);
-        allocator.free(roots.core_root);
-    }
-    var list: std.ArrayListUnmanaged([]u8) = .{};
-    errdefer {
-        for (list.items) |p| allocator.free(p);
-        list.deinit(allocator);
-    }
-    try appendImportFiles(allocator, &list, roots.std_root, text);
-    if (roots.core_root.len > 0) {
-        const scalar = try std.fs.path.join(allocator, &.{ roots.core_root, "scalar.jog" });
-        if (fileExists(scalar)) {
-            try list.append(allocator, scalar);
-        } else {
-            allocator.free(scalar);
-        }
-    }
-    return try list.toOwnedSlice(allocator);
-}
-
-fn findLibraryDeclLine(allocator: std.mem.Allocator, jog: []const u8, text: []const u8, name: []const u8) !?LibDeclLine {
-    const files = try collectLibraryFiles(allocator, jog, text);
-    defer {
-        for (files) |p| allocator.free(p);
-        allocator.free(files);
-    }
-    for (files) |path| {
-        const src = std.fs.cwd().readFileAlloc(allocator, path, 2 * 1024 * 1024) catch continue;
-        defer allocator.free(src);
-        if (findDeclLine(src, name)) |decl| {
-            return .{
-                .path = try allocator.dupe(u8, path),
-                .line = try allocator.dupe(u8, decl),
-            };
-        }
-    }
-    return null;
-}
-
-fn findLibraryDeclLocation(allocator: std.mem.Allocator, jog: []const u8, text: []const u8, name: []const u8) !?LibDeclLoc {
-    const files = try collectLibraryFiles(allocator, jog, text);
-    defer {
-        for (files) |p| allocator.free(p);
-        allocator.free(files);
-    }
-    for (files) |path| {
-        const src = std.fs.cwd().readFileAlloc(allocator, path, 2 * 1024 * 1024) catch continue;
-        defer allocator.free(src);
-        if (findDeclLocation(src, name)) |loc| {
-            return .{
-                .path = try allocator.dupe(u8, path),
-                .line = loc.line,
-                .character = loc.character,
-            };
-        }
-    }
-    return null;
 }
 
 fn resolveJog(allocator: std.mem.Allocator, arg: ?[]const u8) ![]u8 {
@@ -1046,27 +1399,32 @@ fn resolveJog(allocator: std.mem.Allocator, arg: ?[]const u8) ![]u8 {
 }
 
 fn siblingCompilerJog(allocator: std.mem.Allocator) !?[]u8 {
-    const rel = "JogCompiler-v2/zig-out/bin/jog";
-    const cwd_cand = try std.fs.path.join(allocator, &.{ "..", rel });
-    defer allocator.free(cwd_cand);
-    if (fileExists(cwd_cand)) {
-        if (try isV2Jog(allocator, cwd_cand)) return try allocator.dupe(u8, cwd_cand);
+    const rels = [_][]const u8{
+        "JogCompiler-v2/zig-out/bin/jog",
+        "jogcompiler/zig-out/bin/jog",
+    };
+    for (rels) |rel| {
+        const cwd_cand = try std.fs.path.join(allocator, &.{ "..", rel });
+        defer allocator.free(cwd_cand);
+        if (fileExists(cwd_cand)) {
+            if (try isV2Jog(allocator, cwd_cand)) return try allocator.dupe(u8, cwd_cand);
+        }
     }
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe = std.fs.selfExePath(&buf) catch return null;
     const exe_dir = std.fs.path.dirname(exe) orelse return null;
-    // JogLSP/server/zig-out/bin → ../../../JogCompiler-v2/...
-    const from_bin = try std.fs.path.join(allocator, &.{ exe_dir, "../../..", rel });
-    defer allocator.free(from_bin);
-    if (fileExists(from_bin)) {
-        if (try isV2Jog(allocator, from_bin)) return try allocator.dupe(u8, from_bin);
-    }
-    // editors/vscode/bin/server → ../../../JogCompiler-v2/...
-    const from_ext = try std.fs.path.join(allocator, &.{ exe_dir, "../..", rel });
-    defer allocator.free(from_ext);
-    if (fileExists(from_ext)) {
-        if (try isV2Jog(allocator, from_ext)) return try allocator.dupe(u8, from_ext);
+    for (rels) |rel| {
+        const from_bin = try std.fs.path.join(allocator, &.{ exe_dir, "../../..", rel });
+        defer allocator.free(from_bin);
+        if (fileExists(from_bin)) {
+            if (try isV2Jog(allocator, from_bin)) return try allocator.dupe(u8, from_bin);
+        }
+        const from_ext = try std.fs.path.join(allocator, &.{ exe_dir, "../..", rel });
+        defer allocator.free(from_ext);
+        if (fileExists(from_ext)) {
+            if (try isV2Jog(allocator, from_ext)) return try allocator.dupe(u8, from_ext);
+        }
     }
     return null;
 }
