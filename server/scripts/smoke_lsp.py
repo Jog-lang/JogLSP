@@ -259,6 +259,39 @@ def main() -> int:
             complete_prefix="",
         )
 
+        # std/core goto (JOG-95): hover + definition into std/math
+        smoke = EXAMPLES / "std_math_smoke.jog"
+        if smoke.exists():
+            stext = smoke.read_text()
+            with tempfile.NamedTemporaryFile("w", suffix=".jog", delete=False) as f:
+                f.write(stext)
+                stmp = Path(f.name)
+            suri = uri_for(stmp)
+            os.environ.setdefault("JOG_ROOT", str(COMPILER_ROOT))
+            lsp.send("textDocument/didOpen", {
+                "textDocument": {"uri": suri, "languageId": "jog", "version": 1, "text": stext},
+            }, as_request=False)
+            lsp.wait_notification("textDocument/publishDiagnostics")
+            line, col = line_col_of(stext, "cos")
+            hid = lsp.send("textDocument/hover", {
+                "textDocument": {"uri": suri},
+                "position": {"line": line, "character": col},
+            })
+            hover = lsp.wait_response(hid)
+            hval = (hover.get("result") or {}).get("contents", {}).get("value", "")
+            if "fn cos" not in hval and "cos" not in hval:
+                raise AssertionError(f"std.math hover weak: {hval!r}")
+            print("  hover std.math cos: ok")
+            did = lsp.send("textDocument/definition", {
+                "textDocument": {"uri": suri},
+                "position": {"line": line, "character": col},
+            })
+            dres = lsp.wait_response(did).get("result")
+            if not dres or "math.jog" not in str(dres.get("uri", "")):
+                raise AssertionError(f"std.math definition missed: {dres!r}")
+            print("  definition std.math cos: ok", dres.get("uri"))
+            stmp.unlink(missing_ok=True)
+
         # intentional type error → JSON diag contract
         bad = "fn main() {\n  val x: i32 = \"hi\"\n}\n"
         with tempfile.NamedTemporaryFile("w", suffix=".jog", delete=False) as f:
