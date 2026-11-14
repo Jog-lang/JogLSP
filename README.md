@@ -1,6 +1,6 @@
 # JogLSP
 
-Zig language server for **JogCompiler v2** (`jog 0.2.8-v2`+). Diagnostics come from `jog check --diag=json` (with `--module` flags from `jog deps --flags` when `jog.mod` has path requires). Hover / definition / completion cover buffer decls plus concurrency builtins. Document symbols use `jog symbols --json`.
+Zig language server for **JogCompiler Zig develop/v2** (`jog 0.2.9-v2`+). Diagnostics come from `jog check --diag=json` (with `--module` flags from `jog deps --flags` when `jog.mod` has path requires). Hover / definition resolve buffer decls and **`std` / `core` sources** via `jog roots` / `$JOG_ROOT` (JOG-95). Completion covers concurrency builtins + buffer names. Document symbols use `jog symbols --json`.
 
 The old Jog+`require jogc` server is retired; `main` is the Zig v2 server (JOG-92).
 
@@ -34,7 +34,8 @@ Settings: `jog.compilerPath` → v2 `jog` (or `jog-v2`). The client still passes
   - Path `require` / `require.test` → `jog deps --flags` / `--test` → `--module=name=dir`
   - `*.test.jog` buffers pass `--test`
 - Document symbols via `jog symbols --json`
-- Hover / go-to-definition for buffer decls; hover for concurrency builtins
+- Hover / go-to-definition for buffer decls and imported `std.*` / `core` (via compiler roots)
+- Hover for concurrency builtins when no library source matches
 - Completion: concurrency builtins + top-level buffer names
 
 ## `jog check --diag=json` contract

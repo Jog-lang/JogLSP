@@ -12,9 +12,10 @@
 
 ## This repo
 
-- `main` is the Zig v2 server (JOG-92). Do not revive the Jog+jogc in-process server.
+- `main` is the Zig server for JogCompiler Zig **`develop`** / v2 (JOG-92, JOG-95). Do not revive the Jog+jogc in-process server.
 - Build: `cd server && zig build`. Install `zig-out/bin/server` into `editors/vscode/bin/server`.
-- Compiler: argv[1] or `JOG` / `jog-v2` / sibling `JogCompiler-v2` / PATH (`jog 0.2.8-v2`+ for locations, `--module`, `symbols`).
-- Gate: `initialize` succeeds; opening a `.jog` publishes diagnostics from `jog check --diag=json`; hover/completion know `go`/`yield`/`Dispatcher`/`dispatcher_*`; `documentSymbol` works via `jog symbols --json`.
-- Ivan writes the server by hand. Do not rewrite it unasked; do not reimplement the compiler here.
+- Compiler: argv[1] or `JOG` / `jog-v2` / sibling `JogCompiler-v2` / PATH (`jog 0.2.9-v2`+ for roots, locations, `--module`, `symbols`).
+- Library goto: hover / definition resolve into `std` / `core` via `jog roots` or `$JOG_ROOT`.
+- Gate: `initialize` succeeds; opening a `.jog` publishes diagnostics from `jog check --diag=json`; hover/completion know `go`/`yield`/`Dispatcher`/`dispatcher_*`; `documentSymbol` works via `jog symbols --json`; `JOG_LSP_SMOKE` smoke covers std.math goto when examples exist.
+- Ivan writes Jog feature bodies by hand. Zig LSP wiring for compiler contracts is in scope when assigned.
 - Do not start JogSDL/Emscripten from this repo.

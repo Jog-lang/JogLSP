@@ -2,8 +2,9 @@ const std = @import("std");
 
 /// JogLSP for JogCompiler v2: diagnostics via `jog check --diag=json` (+ `--module`
 /// from `jog deps --flags` when jog.mod has path requires), document symbols via
-/// `jog symbols --json`, plus buffer-local hover / definition / completion with
-/// concurrency builtins. argv[1] or JOG / jog-v2 / sibling JogCompiler-v2 selects jog.
+/// `jog symbols --json`, hover / definition into buffer + `std`/`core` sources
+/// (`jog roots` / `$JOG_ROOT`), and concurrency builtins. argv[1] or JOG / jog-v2 /
+/// sibling JogCompiler-v2 selects jog.
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -190,6 +191,20 @@ const Server = struct {
                     });
                     return;
                 }
+                if (try findLibraryDeclLine(self.allocator, self.jog, text, sym)) |lib| {
+                    defer self.allocator.free(lib.line);
+                    defer self.allocator.free(lib.path);
+                    const md = try std.fmt.allocPrint(
+                        self.allocator,
+                        "```jog\n{s}\n```\n\n_{s}_",
+                        .{ lib.line, lib.path },
+                    );
+                    defer self.allocator.free(md);
+                    try self.reply(id, .{
+                        .contents = .{ .kind = "markdown", .value = md },
+                    });
+                    return;
+                }
                 if (lookupBuiltin(sym)) |b| {
                     const md = try std.fmt.allocPrint(
                         self.allocator,
@@ -223,11 +238,6 @@ const Server = struct {
                 return;
             };
             if (findSymbolAt(text, @intCast(line), @intCast(character))) |sym| {
-                // Builtins have no source location; only jump to buffer decls.
-                if (lookupBuiltin(sym) != null and findDeclLocation(text, sym) == null) {
-                    try self.reply(id, null);
-                    return;
-                }
                 if (findDeclLocation(text, sym)) |loc| {
                     try self.reply(id, .{
                         .uri = uri,
@@ -236,6 +246,24 @@ const Server = struct {
                             .end = .{ .line = loc.line, .character = loc.character + sym.len },
                         },
                     });
+                    return;
+                }
+                if (try findLibraryDeclLocation(self.allocator, self.jog, text, sym)) |lib| {
+                    defer self.allocator.free(lib.path);
+                    const file_uri = try pathToFileUri(self.allocator, lib.path);
+                    defer self.allocator.free(file_uri);
+                    try self.reply(id, .{
+                        .uri = file_uri,
+                        .range = .{
+                            .start = .{ .line = lib.line, .character = lib.character },
+                            .end = .{ .line = lib.line, .character = lib.character + sym.len },
+                        },
+                    });
+                    return;
+                }
+                // Builtins / unresolved: no source location.
+                if (lookupBuiltin(sym) != null) {
+                    try self.reply(id, null);
                     return;
                 }
             }
@@ -821,6 +849,170 @@ fn fetchModuleFlags(allocator: std.mem.Allocator, jog: []const u8, root: []const
         return null;
     }
     return try list.toOwnedSlice(allocator);
+}
+
+const LibDeclLine = struct {
+    path: []u8,
+    line: []u8,
+};
+
+const LibDeclLoc = struct {
+    path: []u8,
+    line: u32,
+    character: u32,
+};
+
+fn pathToFileUri(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const abs = std.fs.cwd().realpathAlloc(allocator, path) catch try allocator.dupe(u8, path);
+    defer allocator.free(abs);
+    return try std.fmt.allocPrint(allocator, "file://{s}", .{abs});
+}
+
+const LibRoots = struct {
+    std_root: []u8,
+    core_root: []u8,
+};
+
+fn emptyLibRoots(allocator: std.mem.Allocator) !LibRoots {
+    return .{
+        .std_root = try allocator.dupe(u8, ""),
+        .core_root = try allocator.dupe(u8, ""),
+    };
+}
+
+fn locateLibRoots(allocator: std.mem.Allocator, jog: []const u8) !LibRoots {
+    if (std.posix.getenv("JOG_ROOT")) |env| {
+        if (env.len > 0) {
+            const std_p = try std.fs.path.join(allocator, &.{ env, "std" });
+            const core_p = try std.fs.path.join(allocator, &.{ env, "core" });
+            if (fileExists(std_p) or fileExists(core_p)) {
+                return .{ .std_root = std_p, .core_root = core_p };
+            }
+            allocator.free(std_p);
+            allocator.free(core_p);
+        }
+    }
+    var child = std.process.Child.init(&.{ jog, "roots" }, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return try emptyLibRoots(allocator);
+    const out = child.stdout.?.readToEndAlloc(allocator, 64 * 1024) catch {
+        _ = child.wait() catch {};
+        return try emptyLibRoots(allocator);
+    };
+    defer allocator.free(out);
+    _ = child.wait() catch {};
+
+    var std_root: ?[]u8 = null;
+    var core_root: ?[]u8 = null;
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (std.mem.startsWith(u8, line, "std: ") and !std.mem.eql(u8, line["std: ".len..], "(missing)")) {
+            std_root = try allocator.dupe(u8, line["std: ".len..]);
+        } else if (std.mem.startsWith(u8, line, "core: ") and !std.mem.eql(u8, line["core: ".len..], "(missing)")) {
+            core_root = try allocator.dupe(u8, line["core: ".len..]);
+        }
+    }
+    return .{
+        .std_root = std_root orelse try allocator.dupe(u8, ""),
+        .core_root = core_root orelse try allocator.dupe(u8, ""),
+    };
+}
+
+fn appendImportFiles(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged([]u8),
+    std_root: []const u8,
+    text: []const u8,
+) !void {
+    if (std_root.len == 0) return;
+    var line_start: usize = 0;
+    var i: usize = 0;
+    while (i <= text.len) : (i += 1) {
+        if (i == text.len or text[i] == '\n') {
+            const line = std.mem.trim(u8, text[line_start..i], " \t\r");
+            if (std.mem.startsWith(u8, line, "import std.")) {
+                const rest = line["import std.".len..];
+                var end: usize = 0;
+                while (end < rest.len and isIdentChar(rest[end])) : (end += 1) {}
+                if (end > 0) {
+                    const pkg = rest[0..end];
+                    const file = try std.fmt.allocPrint(allocator, "{s}.jog", .{pkg});
+                    defer allocator.free(file);
+                    const path = try std.fs.path.join(allocator, &.{ std_root, pkg, file });
+                    if (fileExists(path)) {
+                        try list.append(allocator, path);
+                    } else {
+                        allocator.free(path);
+                    }
+                }
+            }
+            line_start = i + 1;
+        }
+    }
+}
+
+fn collectLibraryFiles(allocator: std.mem.Allocator, jog: []const u8, text: []const u8) ![][]u8 {
+    const roots = try locateLibRoots(allocator, jog);
+    defer {
+        allocator.free(roots.std_root);
+        allocator.free(roots.core_root);
+    }
+    var list: std.ArrayListUnmanaged([]u8) = .{};
+    errdefer {
+        for (list.items) |p| allocator.free(p);
+        list.deinit(allocator);
+    }
+    try appendImportFiles(allocator, &list, roots.std_root, text);
+    if (roots.core_root.len > 0) {
+        const scalar = try std.fs.path.join(allocator, &.{ roots.core_root, "scalar.jog" });
+        if (fileExists(scalar)) {
+            try list.append(allocator, scalar);
+        } else {
+            allocator.free(scalar);
+        }
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+fn findLibraryDeclLine(allocator: std.mem.Allocator, jog: []const u8, text: []const u8, name: []const u8) !?LibDeclLine {
+    const files = try collectLibraryFiles(allocator, jog, text);
+    defer {
+        for (files) |p| allocator.free(p);
+        allocator.free(files);
+    }
+    for (files) |path| {
+        const src = std.fs.cwd().readFileAlloc(allocator, path, 2 * 1024 * 1024) catch continue;
+        defer allocator.free(src);
+        if (findDeclLine(src, name)) |decl| {
+            return .{
+                .path = try allocator.dupe(u8, path),
+                .line = try allocator.dupe(u8, decl),
+            };
+        }
+    }
+    return null;
+}
+
+fn findLibraryDeclLocation(allocator: std.mem.Allocator, jog: []const u8, text: []const u8, name: []const u8) !?LibDeclLoc {
+    const files = try collectLibraryFiles(allocator, jog, text);
+    defer {
+        for (files) |p| allocator.free(p);
+        allocator.free(files);
+    }
+    for (files) |path| {
+        const src = std.fs.cwd().readFileAlloc(allocator, path, 2 * 1024 * 1024) catch continue;
+        defer allocator.free(src);
+        if (findDeclLocation(src, name)) |loc| {
+            return .{
+                .path = try allocator.dupe(u8, path),
+                .line = loc.line,
+                .character = loc.character,
+            };
+        }
+    }
+    return null;
 }
 
 fn resolveJog(allocator: std.mem.Allocator, arg: ?[]const u8) ![]u8 {
