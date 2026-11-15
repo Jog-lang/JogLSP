@@ -310,7 +310,11 @@ const Server = struct {
                 if (jsonBool(obj.value, "ok")) {
                     if (jsonString(obj.value, "contents")) |contents| {
                         if (contents.len > 0) {
-                            const md = try std.fmt.allocPrint(self.allocator, "```jog\n{s}\n```", .{contents});
+                            const docs = jsonString(obj.value, "docs") orelse "";
+                            const md = if (docs.len > 0)
+                                try std.fmt.allocPrint(self.allocator, "{s}\n\n```jog\n{s}\n```", .{ docs, contents })
+                            else
+                                try std.fmt.allocPrint(self.allocator, "```jog\n{s}\n```", .{contents});
                             defer self.allocator.free(md);
                             try self.reply(id, .{
                                 .contents = .{ .kind = "markdown", .value = md },
