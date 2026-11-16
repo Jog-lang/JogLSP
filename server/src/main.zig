@@ -3,7 +3,9 @@ const std = @import("std");
 /// JogLSP for JogCompiler v2: diagnostics via `jog check --diag=json`, IDE
 /// features via `jog ide` (hover/definition/complete/references/symbols), plus
 /// concurrency builtins as fallback when the compiler has no source. argv[1] or
-/// JOG / jog-v2 / sibling JogCompiler-v2 selects jog.
+/// JOG / jog-v2 / sibling JogCompiler-v2 selects jog. Module `--module` flags
+/// prefer `jog-build deps --flags` (unpacks `.jogz` into the cache) and fall
+/// back to `jog deps --flags` for plain path requires.
 
 const server_version = "0.2.11-v2";
 const diag_debounce_ms: i64 = 200;
@@ -21,12 +23,14 @@ pub fn main() !void {
     var server = Server{
         .allocator = allocator,
         .jog = try resolveJog(allocator, jog_arg),
+        .jog_build = try resolveJogBuild(allocator),
         .stdin = std.io.getStdIn(),
         .stdout = std.io.getStdOut(),
         .documents = .{},
     };
     defer {
         allocator.free(server.jog);
+        if (server.jog_build) |jb| allocator.free(jb);
         if (server.root_uri) |r| allocator.free(r);
         if (server.pending_diag_uri) |u| allocator.free(u);
         var it = server.documents.iterator();
@@ -43,6 +47,8 @@ pub fn main() !void {
 const Server = struct {
     allocator: std.mem.Allocator,
     jog: []const u8,
+    /// Optional `jog-build` for `--module` flags (required for `.jogz` requires).
+    jog_build: ?[]const u8,
     stdin: std.fs.File,
     stdout: std.fs.File,
     documents: std.StringHashMapUnmanaged([]u8),
@@ -808,7 +814,7 @@ const Server = struct {
         }
         if (try moduleRootOf(self.allocator, path)) |mod_root| {
             defer self.allocator.free(mod_root);
-            if (try fetchModuleFlags(self.allocator, self.jog, mod_root, std.mem.endsWith(u8, path, ".test.jog"))) |flags| {
+            if (try fetchModuleFlags(self.allocator, self.jog, self.jog_build, mod_root, std.mem.endsWith(u8, path, ".test.jog"))) |flags| {
                 defer {
                     for (flags) |f| self.allocator.free(f);
                     self.allocator.free(flags);
@@ -869,7 +875,7 @@ const Server = struct {
         }
         if (try moduleRootOf(self.allocator, path)) |mod_root| {
             defer self.allocator.free(mod_root);
-            if (try fetchModuleFlags(self.allocator, self.jog, mod_root, std.mem.endsWith(u8, path, ".test.jog"))) |flags| {
+            if (try fetchModuleFlags(self.allocator, self.jog, self.jog_build, mod_root, std.mem.endsWith(u8, path, ".test.jog"))) |flags| {
                 defer {
                     for (flags) |f| self.allocator.free(f);
                     self.allocator.free(flags);
@@ -1329,10 +1335,50 @@ fn moduleRootOf(allocator: std.mem.Allocator, file_path: []const u8) !?[]u8 {
     }
 }
 
-fn fetchModuleFlags(allocator: std.mem.Allocator, jog: []const u8, root: []const u8, include_test: bool) !?[][]u8 {
+fn fetchModuleFlags(
+    allocator: std.mem.Allocator,
+    jog: []const u8,
+    jog_build: ?[]const u8,
+    root: []const u8,
+    include_test: bool,
+) !?[][]u8 {
+    // Prefer jog-build: it unpacks `.jogz` into `$JOG_CACHE` and emits source dirs.
+    // `jog deps --flags` only understands path folders and must not point at archives.
+    if (jog_build) |jb| {
+        if (try runDepsFlags(allocator, jb, root, include_test)) |flags| {
+            if (!moduleFlagsPointAtJogz(flags)) return flags;
+            for (flags) |f| allocator.free(f);
+            allocator.free(flags);
+        }
+    }
+    if (try runDepsFlags(allocator, jog, root, include_test)) |flags| {
+        // Drop archive mappings if an old jog still emits them.
+        var kept: std.ArrayListUnmanaged([]u8) = .{};
+        errdefer {
+            for (kept.items) |s| allocator.free(s);
+            kept.deinit(allocator);
+        }
+        for (flags) |f| {
+            if (flagPointsAtJogz(f)) {
+                allocator.free(f);
+                continue;
+            }
+            try kept.append(allocator, f);
+        }
+        allocator.free(flags);
+        if (kept.items.len == 0) {
+            kept.deinit(allocator);
+            return null;
+        }
+        return try kept.toOwnedSlice(allocator);
+    }
+    return null;
+}
+
+fn runDepsFlags(allocator: std.mem.Allocator, bin: []const u8, root: []const u8, include_test: bool) !?[][]u8 {
     var argv: std.ArrayListUnmanaged([]const u8) = .{};
     defer argv.deinit(allocator);
-    try argv.append(allocator, jog);
+    try argv.append(allocator, bin);
     try argv.append(allocator, "deps");
     try argv.append(allocator, "--flags");
     if (include_test) try argv.append(allocator, "--test");
@@ -1342,10 +1388,13 @@ fn fetchModuleFlags(allocator: std.mem.Allocator, jog: []const u8, root: []const
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
     child.cwd = root;
-    try child.spawn();
-    const out = try child.stdout.?.readToEndAlloc(allocator, 1024 * 1024);
+    child.spawn() catch return null;
+    const out = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+        _ = child.wait() catch {};
+        return null;
+    };
     defer allocator.free(out);
-    _ = try child.wait();
+    _ = child.wait() catch {};
 
     var list: std.ArrayListUnmanaged([]u8) = .{};
     errdefer {
@@ -1364,6 +1413,41 @@ fn fetchModuleFlags(allocator: std.mem.Allocator, jog: []const u8, root: []const
         return null;
     }
     return try list.toOwnedSlice(allocator);
+}
+
+fn flagPointsAtJogz(flag: []const u8) bool {
+    const eq = std.mem.indexOfScalar(u8, flag, '=') orelse return false;
+    const path = flag[eq + 1 ..];
+    return std.ascii.endsWithIgnoreCase(path, ".jogz");
+}
+
+fn moduleFlagsPointAtJogz(flags: []const []u8) bool {
+    for (flags) |f| {
+        if (flagPointsAtJogz(f)) return true;
+    }
+    return false;
+}
+
+fn resolveJogBuild(allocator: std.mem.Allocator) !?[]u8 {
+    if (std.posix.getenv("JOG_BUILD")) |j| {
+        if (j.len > 0 and fileExists(j)) return try allocator.dupe(u8, j);
+    }
+    if (std.posix.getenv("HOME")) |home| {
+        const p = try std.fs.path.join(allocator, &.{ home, ".local/bin/jog-build" });
+        if (fileExists(p)) return p;
+        allocator.free(p);
+    }
+    const rels = [_][]const u8{
+        "JogBuild/zig-out/bin/jog-build",
+        "jogbuild/zig-out/bin/jog-build",
+    };
+    for (rels) |rel| {
+        const cwd_cand = try std.fs.path.join(allocator, &.{ "..", rel });
+        defer allocator.free(cwd_cand);
+        if (fileExists(cwd_cand)) return try allocator.dupe(u8, cwd_cand);
+    }
+    if (try which(allocator, "jog-build")) |p| return p;
+    return null;
 }
 
 fn pathToFileUri(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
