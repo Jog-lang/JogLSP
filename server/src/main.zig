@@ -8,7 +8,9 @@ const std = @import("std");
 /// back to `jog deps --flags` for plain path requires.
 
 const server_version = "0.2.11-v2";
-const diag_debounce_ms: i64 = 200;
+/// Debounce full-module `jog check` after didChange. Residual ~1s cost is the
+/// compiler check itself (Wave 4 Friction — won't-fix further without incremental check).
+const diag_debounce_ms: i64 = 500;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
